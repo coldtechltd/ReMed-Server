@@ -7,6 +7,7 @@ import {
   timestamp,
 } from 'drizzle-orm/pg-core';
 import { users } from './user';
+import { countries } from './country';
 
 export const profiles = pgTable('profiles', {
   id: uuid('id').defaultRandom().primaryKey(),
@@ -20,6 +21,10 @@ export const profiles = pgTable('profiles', {
   height: integer('height'), // in cm
   weight: integer('weight'), // in kg
   gender: varchar('gender', { length: 50 }),
-  country: varchar('country', { length: 100 }),
+  countryId: uuid('country_id')
+    .references(() => countries.id)
+    .notNull(),
+  phoneNumber: varchar('phone_number', { length: 20 }).notNull(),
+  diagnosedWith: varchar('diagnosed_with', { length: 255 }),
   createdAt: timestamp('created_at').defaultNow(),
 });
