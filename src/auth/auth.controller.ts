@@ -1,4 +1,12 @@
-import { Controller, Post, Request, UseGuards, Get, Res, Body } from '@nestjs/common';
+import {
+  Controller,
+  Post,
+  Request,
+  UseGuards,
+  Get,
+  Res,
+  Body,
+} from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { LoginDto } from './dto/login.dto';
@@ -19,7 +27,8 @@ export class AuthController {
       await this.auth.updatePushToken(user.id, loginDto.pushToken);
     }
 
-    return this.auth.generateTokens(user);
+    const hasProfile = await this.auth.hasUserProfile(user.id);
+    return this.auth.generateTokens(user, hasProfile);
   }
 
   @Post('signup')
@@ -35,7 +44,8 @@ export class AuthController {
   @Get('google/callback')
   @UseGuards()
   async googleCallback(@Request() req, @Res() res) {
-    const tokens = await this.auth.generateTokens(req.user);
+    const hasProfile = await this.auth.hasUserProfile(req.user.id);
+    const tokens = this.auth.generateTokens(req.user, hasProfile);
 
     return res.json(tokens); // Or redirect with tokens
   }

@@ -1,9 +1,13 @@
-import { Injectable, UnauthorizedException, BadRequestException } from '@nestjs/common';
+import {
+  Injectable,
+  UnauthorizedException,
+  BadRequestException,
+} from '@nestjs/common';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
 
 import { Inject } from '@nestjs/common';
 import { eq } from 'drizzle-orm';
-import { users } from '../db/schema';
+import { users, profiles } from '../db/schema';
 import * as bcrypt from 'bcrypt';
 import { JwtService } from '@nestjs/jwt';
 import { RegisterDto } from './dto/register.dto';
@@ -37,6 +41,14 @@ export class AuthService {
       .where(eq(users.id, userId));
   }
 
+  async hasUserProfile(userId: string): Promise<boolean> {
+    const [profile] = await this.db
+      .select()
+      .from(profiles)
+      .where(eq(profiles.userId, userId));
+    return !!profile;
+  }
+
   // ---------------- REGISTER ------------------
   async register(registerDto: RegisterDto) {
     const { email, password } = registerDto;
@@ -60,7 +72,7 @@ export class AuthService {
       })
       .returning();
 
-    return this.generateTokens(newUser);
+    return this.generateTokens(newUser, false);
   }
 
   // ---------------- GOOGLE LOGIN ------------------
@@ -90,7 +102,7 @@ export class AuthService {
   }
 
   // ---------------- TOKENS ------------------
-  generateTokens(user: any) {
+  generateTokens(user: any, hasProfile: boolean) {
     const payload = {
       sub: user.id,
       email: user.email,
@@ -100,6 +112,6 @@ export class AuthService {
     const accessToken = this.jwt.sign(payload, { expiresIn: '15m' });
     const refreshToken = this.jwt.sign(payload, { expiresIn: '7d' });
 
-    return { accessToken, refreshToken };
+    return { accessToken, refreshToken, hasProfile };
   }
 }
