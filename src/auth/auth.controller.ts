@@ -6,6 +6,7 @@ import {
   Get,
   Res,
   Body,
+  Patch,
 } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
@@ -55,5 +56,16 @@ export class AuthController {
   @Get('me')
   async me(@Request() req) {
     return req.user;
+  }
+
+  // ---------------- PUSH TOKEN ------------------
+  @UseGuards(JwtAuthGuard)
+  @Patch('push-token')
+  async updatePushToken(@Request() req, @Body('token') token: string) {
+    if (!token) {
+      return { success: false, message: 'Token is required' };
+    }
+    await this.auth.updatePushToken(req.user.id, token);
+    return { success: true, message: 'Push token updated successfully' };
   }
 }

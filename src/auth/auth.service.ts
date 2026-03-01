@@ -37,7 +37,7 @@ export class AuthService {
   async updatePushToken(userId: string, pushToken: string) {
     await this.db
       .update(users)
-      .set({ expo_push_token: pushToken })
+      .set({ expoPushToken: pushToken })
       .where(eq(users.id, userId));
   }
 

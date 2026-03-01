@@ -7,7 +7,7 @@ export const medications = pgTable('medications', {
     .references(() => users.id)
     .notNull(),
   name: varchar('name', { length: 255 }).notNull(), // e.g. "Malaria Treatment"
-  description: text('description'),
+  notes: text('notes'),
   startDate: timestamp('start_date').notNull(),
   endDate: timestamp('end_date'),
   createdAt: timestamp('created_at').defaultNow(),

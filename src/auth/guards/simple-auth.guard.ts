@@ -27,7 +27,7 @@ export class SimpleAuthGuard implements CanActivate {
     try {
       const payload = this.jwtService.verify(token);
       // Attach user to request object so controllers can access it
-      request.user = { userId: payload.sub, email: payload.email };
+      request.user = { id: payload.sub, email: payload.email };
       return true;
     } catch (error) {
       throw new UnauthorizedException('Invalid or expired token');
