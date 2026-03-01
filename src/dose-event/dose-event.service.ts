@@ -5,7 +5,7 @@ import {
   ForbiddenException,
 } from '@nestjs/common';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { eq, lte, and, desc } from 'drizzle-orm';
+import { eq, lte, gte, and, desc } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { UpdateDoseEventDto } from './dto/update-dose-event.dto';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
@@ -81,7 +81,51 @@ export class DoseEventService {
           eq(schema.doseEvents.status, 'pending'),
         ),
       )
-      .orderBy(schema.doseEvents.takenAt);
+      .orderBy(schema.doseEvents.scheduledFor);
+
+    return results.map((r) => ({
+      ...r.event,
+      schedule: r.schedule,
+      dosageForm: r.dosageForm,
+      medication: r.medication,
+    }));
+  }
+
+  async findEventsByDate(userId: string, dateStr: string) {
+    const targetDate = new Date(dateStr);
+    const startOfDay = new Date(targetDate);
+    startOfDay.setHours(0, 0, 0, 0);
+    const endOfDay = new Date(targetDate);
+    endOfDay.setHours(23, 59, 59, 999);
+
+    const results = await this.db
+      .select({
+        event: schema.doseEvents,
+        schedule: schema.schedules,
+        dosageForm: schema.dosageForms,
+        medication: schema.medications,
+      })
+      .from(schema.doseEvents)
+      .innerJoin(
+        schema.schedules,
+        eq(schema.doseEvents.scheduleId, schema.schedules.id),
+      )
+      .innerJoin(
+        schema.dosageForms,
+        eq(schema.schedules.dosageFormId, schema.dosageForms.id),
+      )
+      .innerJoin(
+        schema.medications,
+        eq(schema.dosageForms.medicationId, schema.medications.id),
+      )
+      .where(
+        and(
+          eq(schema.medications.userId, userId),
+          gte(schema.doseEvents.scheduledFor, startOfDay),
+          lte(schema.doseEvents.scheduledFor, endOfDay),
+        ),
+      )
+      .orderBy(schema.doseEvents.scheduledFor);
 
     return results.map((r) => ({
       ...r.event,
@@ -139,9 +183,15 @@ export class DoseEventService {
     const existing = await this.findOne(id, userId);
 
     const updateData: any = {};
-    if (updateDto.status) updateData.status = updateDto.status;
-    if (updateDto.reminderSent !== undefined)
+    if (updateDto.status) {
+      updateData.status = updateDto.status;
+      if (updateDto.status === 'taken') {
+        updateData.takenAt = new Date();
+      }
+    }
+    if (updateDto.reminderSent !== undefined) {
       updateData.reminderSent = updateDto.reminderSent;
+    }
 
     if (Object.keys(updateData).length === 0) return existing;
 

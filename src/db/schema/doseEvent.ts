@@ -12,6 +12,7 @@ export const doseEvents = pgTable('dose_events', {
   scheduleId: uuid('schedule_id')
     .references(() => schedules.id)
     .notNull(),
+  scheduledFor: timestamp('scheduled_for').defaultNow().notNull(),
   takenAt: timestamp('taken_at'),
   status: varchar('status', { length: 50 }).default('pending'), // pending | taken | missed
   reminderSent: boolean('reminder_sent').default(false),

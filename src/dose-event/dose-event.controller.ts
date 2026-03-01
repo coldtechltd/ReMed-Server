@@ -4,6 +4,7 @@ import {
   Body,
   Patch,
   Param,
+  Query,
   UseGuards,
   Request,
 } from '@nestjs/common';
@@ -29,6 +30,12 @@ export class DoseEventController {
   @ApiOperation({ summary: 'Get all upcoming pending dose events' })
   getUpcoming(@Request() req) {
     return this.doseEventService.getUpcoming(req.user.id);
+  }
+
+  @Get('by-date')
+  @ApiOperation({ summary: 'Get dose events for a specific date' })
+  findEventsByDate(@Request() req, @Query('date') date: string) {
+    return this.doseEventService.findEventsByDate(req.user.id, date);
   }
 
   @Get(':id')
