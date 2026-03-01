@@ -9,9 +9,12 @@ import { MedicationModule } from './medication/medication.module';
 import { DosageFormModule } from './dosage-form/dosage-form.module';
 import { ReminderModule } from './reminder/reminder.module';
 import { DoseEventModule } from './dose-event/dose-event.module';
+import { ScheduleModule } from '@nestjs/schedule';
+import { NotificationsModule } from './notifications/notifications.module';
 
 @Module({
   imports: [
+    ScheduleModule.forRoot(),
     ConfigModule.forRoot({
       isGlobal: true,
     }),
@@ -33,6 +36,7 @@ import { DoseEventModule } from './dose-event/dose-event.module';
     DosageFormModule,
     ReminderModule,
     DoseEventModule,
+    NotificationsModule,
   ],
 })
 export class AppModule {}

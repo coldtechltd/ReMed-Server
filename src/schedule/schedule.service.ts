@@ -5,8 +5,9 @@ import {
   ForbiddenException,
   BadRequestException,
 } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { eq } from 'drizzle-orm';
+import { eq, and } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { CreateScheduleDto } from './dto/create-schedule.dto';
 import { UpdateScheduleDto } from './dto/update-schedule.dto';
@@ -218,11 +219,25 @@ export class ScheduleService {
 
       const values = uniqueTimes.map((time) => ({
         scheduleId: scheduleId,
-        takenAt: time,
+        scheduledFor: time,
         status: 'pending',
       }));
 
       await this.db.insert(schema.doseEvents).values(values);
     }
+  }
+
+  @Cron(CronExpression.EVERY_DAY_AT_MIDNIGHT)
+  async handleDailyDoseEventGeneration() {
+    console.log('Running daily dose event generation...');
+    const activeSchedules = await this.db
+      .select()
+      .from(schema.schedules)
+      .where(eq(schema.schedules.isActive, true));
+
+    for (const schedule of activeSchedules) {
+      await this.generateInitialDoseEvents(schedule.id, schedule as any);
+    }
+    console.log('Finished daily dose event generation.');
   }
 }
