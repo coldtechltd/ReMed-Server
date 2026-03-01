@@ -24,7 +24,12 @@ export class DoseEventService {
     // Drizzle query API doesn't support deep nested mapping easily without custom manual mapping,
     // so we'll do an inner join to fetch events strictly belonging to the user
     const results = await this.db
-      .select({ event: schema.doseEvents })
+      .select({
+        event: schema.doseEvents,
+        schedule: schema.schedules,
+        dosageForm: schema.dosageForms,
+        medication: schema.medications,
+      })
       .from(schema.doseEvents)
       .innerJoin(
         schema.schedules,
@@ -41,12 +46,22 @@ export class DoseEventService {
       .where(eq(schema.medications.userId, userId))
       .orderBy(desc(schema.doseEvents.takenAt));
 
-    return results.map((r) => r.event);
+    return results.map((r) => ({
+      ...r.event,
+      schedule: r.schedule,
+      dosageForm: r.dosageForm,
+      medication: r.medication,
+    }));
   }
 
   async getUpcoming(userId: string) {
     const results = await this.db
-      .select({ event: schema.doseEvents })
+      .select({
+        event: schema.doseEvents,
+        schedule: schema.schedules,
+        dosageForm: schema.dosageForms,
+        medication: schema.medications,
+      })
       .from(schema.doseEvents)
       .innerJoin(
         schema.schedules,
@@ -68,13 +83,21 @@ export class DoseEventService {
       )
       .orderBy(schema.doseEvents.takenAt);
 
-    return results.map((r) => r.event);
+    return results.map((r) => ({
+      ...r.event,
+      schedule: r.schedule,
+      dosageForm: r.dosageForm,
+      medication: r.medication,
+    }));
   }
 
   async findOne(id: string, userId: string) {
     const results = await this.db
       .select({
         event: schema.doseEvents,
+        schedule: schema.schedules,
+        dosageForm: schema.dosageForms,
+        medication: schema.medications,
         medUserId: schema.medications.userId,
       })
       .from(schema.doseEvents)
@@ -103,7 +126,13 @@ export class DoseEventService {
       );
     }
 
-    return results[0].event;
+    const r = results[0];
+    return {
+      ...r.event,
+      schedule: r.schedule,
+      dosageForm: r.dosageForm,
+      medication: r.medication,
+    };
   }
 
   async update(id: string, userId: string, updateDto: UpdateDoseEventDto) {
