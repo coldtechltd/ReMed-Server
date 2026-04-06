@@ -4,18 +4,24 @@ import {
   NotFoundException,
   ForbiddenException,
   BadRequestException,
+  Logger,
 } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { eq, and } from 'drizzle-orm';
+import { eq, and, gte, lte } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { CreateScheduleDto } from './dto/create-schedule.dto';
 import { UpdateScheduleDto } from './dto/update-schedule.dto';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
 import { DosageFormService } from '../dosage-form/dosage-form.service';
 
+// Abbreviated day names matching the stored daysOfWeek values
+const DAY_ABBREVS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
 @Injectable()
 export class ScheduleService {
+  private readonly logger = new Logger(ScheduleService.name);
+
   constructor(
     @Inject(DRIZZLE_CLIENT)
     private readonly db: NodePgDatabase<typeof schema>,
@@ -163,7 +169,22 @@ export class ScheduleService {
     const startOfDay = new Date(now);
     startOfDay.setHours(0, 0, 0, 0);
 
-    const limit = new Date(now.getTime() + 24 * 60 * 60 * 1000); // 24 hours from now
+    const limit = new Date(now.getTime() + 24 * 60 * 60 * 1000); // 24 hours ahead
+
+    // Fetch already-existing scheduledFor times for this schedule in the window
+    // to prevent duplicate inserts on repeated runs.
+    const existing = await this.db
+      .select({ scheduledFor: schema.doseEvents.scheduledFor })
+      .from(schema.doseEvents)
+      .where(
+        and(
+          eq(schema.doseEvents.scheduleId, scheduleId),
+          gte(schema.doseEvents.scheduledFor, startOfDay),
+          lte(schema.doseEvents.scheduledFor, limit),
+        ),
+      );
+    const existingMs = new Set(existing.map((e) => e.scheduledFor.getTime()));
+
     const eventTimes: Date[] = [];
 
     if (payload.type === 'specific_times' && payload.specificTimes) {
@@ -173,6 +194,16 @@ export class ScheduleService {
       days.push(tomorrow);
 
       for (const day of days) {
+        // Filter by daysOfWeek if specified
+        const dayAbbrev = DAY_ABBREVS[day.getDay()];
+        if (
+          payload.daysOfWeek &&
+          payload.daysOfWeek.length > 0 &&
+          !payload.daysOfWeek.includes(dayAbbrev)
+        ) {
+          continue;
+        }
+
         for (const timeStr of payload.specificTimes) {
           const [hours, minutes] = timeStr.split(':').map(Number);
           const eventTime = new Date(day);
@@ -213,23 +244,27 @@ export class ScheduleService {
     }
 
     if (eventTimes.length > 0) {
-      const uniqueTimes = Array.from(
+      // Deduplicate within generated list, then exclude already-existing ones
+      const newTimes = Array.from(
         new Set(eventTimes.map((t) => t.getTime())),
-      ).map((t) => new Date(t));
+      )
+        .filter((ms) => !existingMs.has(ms))
+        .map((ms) => new Date(ms));
 
-      const values = uniqueTimes.map((time) => ({
-        scheduleId: scheduleId,
-        scheduledFor: time,
-        status: 'pending',
-      }));
-
-      await this.db.insert(schema.doseEvents).values(values);
+      if (newTimes.length > 0) {
+        const values = newTimes.map((time) => ({
+          scheduleId,
+          scheduledFor: time,
+          status: 'pending',
+        }));
+        await this.db.insert(schema.doseEvents).values(values);
+      }
     }
   }
 
   @Cron(CronExpression.EVERY_DAY_AT_MIDNIGHT)
   async handleDailyDoseEventGeneration() {
-    console.log('Running daily dose event generation...');
+    this.logger.log('Running daily dose event generation...');
     const activeSchedules = await this.db
       .select()
       .from(schema.schedules)
@@ -238,6 +273,30 @@ export class ScheduleService {
     for (const schedule of activeSchedules) {
       await this.generateInitialDoseEvents(schedule.id, schedule as any);
     }
-    console.log('Finished daily dose event generation.');
+    this.logger.log(
+      `Finished daily dose event generation for ${activeSchedules.length} schedules.`,
+    );
+  }
+
+  @Cron(CronExpression.EVERY_HOUR)
+  async handleMissedDoseMarking() {
+    this.logger.log('Checking for missed doses...');
+    // Grace window: 2 hours after scheduled time before marking missed
+    const cutoff = new Date(Date.now() - 2 * 60 * 60 * 1000);
+
+    const result = await this.db
+      .update(schema.doseEvents)
+      .set({ status: 'missed' })
+      .where(
+        and(
+          eq(schema.doseEvents.status, 'pending'),
+          lte(schema.doseEvents.scheduledFor, cutoff),
+        ),
+      )
+      .returning({ id: schema.doseEvents.id });
+
+    if (result.length > 0) {
+      this.logger.log(`Marked ${result.length} dose events as missed.`);
+    }
   }
 }

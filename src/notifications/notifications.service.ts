@@ -27,6 +27,7 @@ export class NotificationsService {
       .select({
         event: schema.doseEvents,
         medication: schema.medications,
+        dosageForm: schema.dosageForms,
         user: schema.users,
       })
       .from(schema.doseEvents)
@@ -70,9 +71,10 @@ export class NotificationsService {
       messages.push({
         to: dose.user.expoPushToken,
         sound: 'default',
-        title: 'Medication Reminder',
-        body: `It's time to take your medication: ${dose.medication.name}`,
+        title: `Time to take ${dose.medication.name}`,
+        body: `${dose.dosageForm.dosageAmount} ${dose.dosageForm.dosageUnit} of ${dose.dosageForm.name}`,
         data: { eventId: dose.event.id },
+        categoryId: 'dose_reminder',
       });
 
       eventIdsToUpdate.push(dose.event.id);
