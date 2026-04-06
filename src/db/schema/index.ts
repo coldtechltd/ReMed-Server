@@ -1,5 +1,6 @@
 export * from './user';
 export * from './country';
+export * from './condition';
 export * from './profile';
 export * from './medication';
 export * from './dosageForm';

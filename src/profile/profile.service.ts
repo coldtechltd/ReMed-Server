@@ -1,12 +1,16 @@
-import { Injectable, Inject, BadRequestException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Inject, Injectable, NotFoundException } from '@nestjs/common';
 import { eq } from 'drizzle-orm';
+import { ConditionService } from '../condition/condition.service';
 import { profiles } from '../db/schema';
 import { CreateProfileDto } from './dto/create-profile.dto';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 
 @Injectable()
 export class ProfileService {
-  constructor(@Inject('DRIZZLE_CLIENT') private db: any) {}
+  constructor(
+    @Inject('DRIZZLE_CLIENT') private db: any,
+    private readonly conditionService: ConditionService,
+  ) {}
 
   async createProfile(userId: string, dto: CreateProfileDto) {
     const [existing] = await this.db
@@ -18,12 +22,13 @@ export class ProfileService {
       throw new BadRequestException('Profile already exists for this user');
     }
 
+    if (dto.diagnosedWith?.trim()) {
+      await this.conditionService.upsert(dto.diagnosedWith.trim());
+    }
+
     const [newProfile] = await this.db
       .insert(profiles)
-      .values({
-        userId,
-        ...dto,
-      })
+      .values({ userId, ...dto })
       .returning();
 
     return newProfile;
@@ -50,6 +55,10 @@ export class ProfileService {
 
     if (!existing) {
       throw new NotFoundException('Profile not found');
+    }
+
+    if (dto.diagnosedWith?.trim()) {
+      await this.conditionService.upsert(dto.diagnosedWith.trim());
     }
 
     const [updatedProfile] = await this.db

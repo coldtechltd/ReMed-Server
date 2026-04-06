@@ -1,11 +1,13 @@
 import { Module } from '@nestjs/common';
-import { ProfileService } from './profile.service';
-import { ProfileController } from './profile.controller';
 import { AuthModule } from '../auth/auth.module';
+import { ConditionModule } from '../condition/condition.module';
+import { ProfileController } from './profile.controller';
+import { ProfileService } from './profile.service';
 
 @Module({
-  imports: [AuthModule],
+  imports: [AuthModule, ConditionModule],
   controllers: [ProfileController],
   providers: [ProfileService],
+  exports: [ProfileService],
 })
 export class ProfileModule {}

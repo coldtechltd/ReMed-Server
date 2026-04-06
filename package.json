@@ -36,6 +36,7 @@
     "dotenv": "^17.2.3",
     "drizzle-orm": "^0.44.7",
     "expo-server-sdk": "^6.0.0",
+    "groq-sdk": "^1.1.2",
     "ioredis": "^5.8.2",
     "passport": "^0.7.0",
     "passport-google-oauth20": "^2.0.0",
