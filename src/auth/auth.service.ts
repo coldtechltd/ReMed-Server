@@ -109,8 +109,8 @@ export class AuthService {
       tokenVersion: user.tokenVersion,
     };
 
-    const accessToken = this.jwt.sign(payload, { expiresIn: '15m' });
-    const refreshToken = this.jwt.sign(payload, { expiresIn: '7d' });
+    const accessToken = this.jwt.sign(payload, { expiresIn: '7d' });
+    const refreshToken = this.jwt.sign(payload, { expiresIn: '30d' });
 
     return { accessToken, refreshToken, hasProfile };
   }

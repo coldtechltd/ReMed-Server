@@ -14,6 +14,9 @@ import { ScheduleModule } from '@nestjs/schedule';
 import { NotificationsModule } from './notifications/notifications.module';
 import { AiModule } from './ai/ai.module';
 
+import { APP_INTERCEPTOR } from '@nestjs/core';
+import { AuditInterceptor } from './common/interceptors/audit.interceptor';
+
 @Module({
   imports: [
     ScheduleModule.forRoot(),
@@ -41,6 +44,12 @@ import { AiModule } from './ai/ai.module';
     DoseEventModule,
     NotificationsModule,
     AiModule,
+  ],
+  providers: [
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: AuditInterceptor,
+    },
   ],
 })
 export class AppModule {}
