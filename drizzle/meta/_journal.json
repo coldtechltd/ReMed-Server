@@ -8,6 +8,13 @@
       "when": 1766953415765,
       "tag": "0000_mixed_nico_minoru",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1775735729202,
+      "tag": "0001_whole_firebrand",
+      "breakpoints": true
     }
   ]
 }
