@@ -71,7 +71,7 @@ export class AiService {
   async chat(
     userId: string,
     message: string,
-    history: ChatMessage[],
+    history: ChatMessage[] = [],
   ): Promise<string> {
     // Build context prefix from profile (once, as system injection)
     let profileContext = '';
@@ -91,9 +91,16 @@ export class AiService {
       ? `${SYSTEM_PROMPT}\n\nUser context: ${profileContext}`
       : SYSTEM_PROMPT;
 
+    // Defence-in-depth: even though the DTO restricts roles, strip anything
+    // that isn't a user/assistant turn before forwarding to the model so the
+    // system guardrails can never be overridden by injected history.
+    const safeHistory = history.filter(
+      (m) => m.role === 'user' || m.role === 'assistant',
+    );
+
     const messages: Groq.Chat.ChatCompletionMessageParam[] = [
       { role: 'system', content: systemContent },
-      ...history.slice(-10).map((m) => ({
+      ...safeHistory.slice(-10).map((m) => ({
         role: m.role as 'user' | 'assistant',
         content: m.content,
       })),

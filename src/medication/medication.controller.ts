@@ -12,6 +12,7 @@ import {
 import { MedicationService } from './medication.service';
 import { CreateMedicationDto } from './dto/create-medication.dto';
 import { UpdateMedicationDto } from './dto/update-medication.dto';
+import { CreateFullMedicationDto } from './dto/create-full-medication.dto';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 
@@ -26,6 +27,15 @@ export class MedicationController {
   @ApiOperation({ summary: 'Create a new medication treatment' })
   create(@Request() req, @Body() createMedicationDto: CreateMedicationDto) {
     return this.medicationService.create(req.user.id, createMedicationDto);
+  }
+
+  @Post('full')
+  @ApiOperation({
+    summary:
+      'Atomically create a medication with its dosage forms, schedules, and dose events',
+  })
+  createFull(@Request() req, @Body() dto: CreateFullMedicationDto) {
+    return this.medicationService.createFull(req.user.id, dto);
   }
 
   @Get()

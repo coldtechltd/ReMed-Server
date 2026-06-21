@@ -1,9 +1,12 @@
 import { Body, Controller, Post, Request, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { AiService } from './ai.service';
 import { ChatDto } from './dto/chat.dto';
 
+// Groq calls cost money — cap usage at 20 requests / minute per IP.
+@Throttle({ default: { limit: 20, ttl: 60000 } })
 @ApiTags('ai')
 @ApiBearerAuth()
 @UseGuards(JwtAuthGuard)

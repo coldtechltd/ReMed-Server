@@ -8,6 +8,8 @@ import {
   Body,
   Patch,
 } from '@nestjs/common';
+import { AuthGuard } from '@nestjs/passport';
+import { Throttle } from '@nestjs/throttler';
 import { AuthService } from './auth.service';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { LoginDto } from './dto/login.dto';
@@ -17,6 +19,8 @@ import { RegisterDto } from './dto/register.dto';
 export class AuthController {
   constructor(private auth: AuthService) {}
 
+  // Brute-force protection: 5 attempts / minute per IP.
+  @Throttle({ default: { limit: 5, ttl: 60000 } })
   @Post('login')
   async login(@Body() loginDto: LoginDto) {
     const user = await this.auth.validateLocalUser(
@@ -32,6 +36,7 @@ export class AuthController {
     return this.auth.generateTokens(user, hasProfile);
   }
 
+  @Throttle({ default: { limit: 5, ttl: 60000 } })
   @Post('signup')
   async signup(@Body() registerDto: RegisterDto) {
     return this.auth.register(registerDto);
@@ -39,11 +44,13 @@ export class AuthController {
 
   // ---------------- GOOGLE AUTH ------------------
   @Get('google')
-  @UseGuards()
-  async googleLogin() {}
+  @UseGuards(AuthGuard('google'))
+  async googleLogin() {
+    // Initiates the Google OAuth flow; the guard handles the redirect.
+  }
 
   @Get('google/callback')
-  @UseGuards()
+  @UseGuards(AuthGuard('google'))
   async googleCallback(@Request() req, @Res() res) {
     const hasProfile = await this.auth.hasUserProfile(req.user.id);
     const tokens = this.auth.generateTokens(req.user, hasProfile);
@@ -56,6 +63,15 @@ export class AuthController {
   @Get('me')
   async me(@Request() req) {
     return req.user;
+  }
+
+  // ---------------- LOGOUT ------------------
+  // Bumps the user's tokenVersion so every previously issued token is rejected.
+  @UseGuards(JwtAuthGuard)
+  @Post('logout')
+  async logout(@Request() req) {
+    await this.auth.logout(req.user.id);
+    return { success: true, message: 'Logged out successfully' };
   }
 
   // ---------------- PUSH TOKEN ------------------

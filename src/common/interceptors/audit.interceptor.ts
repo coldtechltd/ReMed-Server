@@ -15,7 +15,7 @@ export class AuditInterceptor implements NestInterceptor {
   intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
     const request = context.switchToHttp().getRequest();
     const { method, url, user } = request;
-    const userId = user?.sub || 'anonymous';
+    const userId = user?.id || 'anonymous';
     const timestamp = new Date().toISOString();
 
     // Sensitive resources that need strict auditing

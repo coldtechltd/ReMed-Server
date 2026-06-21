@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
-import { ConfigModule, ConfigService } from '@nestjs/config';
-import { BullModule } from '@nestjs/bullmq';
+import { ConfigModule } from '@nestjs/config';
+import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
+import { APP_GUARD } from '@nestjs/core';
 import { DrizzleModule } from './db/drizzle.module';
 import { AuthModule } from './auth/auth.module';
 import { ProfileModule } from './profile/profile.module';
@@ -8,7 +9,6 @@ import { CountryModule } from './country/country.module';
 import { ConditionModule } from './condition/condition.module';
 import { MedicationModule } from './medication/medication.module';
 import { DosageFormModule } from './dosage-form/dosage-form.module';
-import { ReminderModule } from './reminder/reminder.module';
 import { DoseEventModule } from './dose-event/dose-event.module';
 import { ScheduleModule } from '@nestjs/schedule';
 import { NotificationsModule } from './notifications/notifications.module';
@@ -23,16 +23,9 @@ import { AuditInterceptor } from './common/interceptors/audit.interceptor';
     ConfigModule.forRoot({
       isGlobal: true,
     }),
-    BullModule.forRootAsync({
-      imports: [ConfigModule],
-      useFactory: async (configService: ConfigService) => ({
-        connection: {
-          host: configService.get('REDIS_HOST') || 'localhost',
-          port: configService.get('REDIS_PORT') || 6379,
-        },
-      }),
-      inject: [ConfigService],
-    }),
+    // Global rate limiting: 100 requests / minute per IP by default.
+    // Stricter limits are applied per-route via @Throttle (auth, AI).
+    ThrottlerModule.forRoot([{ ttl: 60000, limit: 100 }]),
     DrizzleModule,
     AuthModule,
     ProfileModule,
@@ -40,12 +33,15 @@ import { AuditInterceptor } from './common/interceptors/audit.interceptor';
     ConditionModule,
     MedicationModule,
     DosageFormModule,
-    ReminderModule,
     DoseEventModule,
     NotificationsModule,
     AiModule,
   ],
   providers: [
+    {
+      provide: APP_GUARD,
+      useClass: ThrottlerGuard,
+    },
     {
       provide: APP_INTERCEPTOR,
       useClass: AuditInterceptor,

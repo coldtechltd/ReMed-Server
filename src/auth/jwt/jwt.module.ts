@@ -9,7 +9,9 @@ import { JwtStrategy } from './jwt.strategy';
       imports: [ConfigModule],
       useFactory: async (configService: ConfigService) => ({
         secret: configService.get<string>('JWT_SECRET'),
-        signOptions: { expiresIn: '15m' },
+        // AuthService.generateTokens sets per-token expiry explicitly; this is
+        // only the fallback for any other sign() call.
+        signOptions: { expiresIn: '7d' },
       }),
       inject: [ConfigService],
     }),

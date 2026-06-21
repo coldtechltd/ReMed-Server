@@ -35,8 +35,15 @@ async function bootstrap() {
   );
 
   // CORS
+  // CORS. FRONTEND_URL may be a comma-separated allowlist. When unset, reflect
+  // the request origin (`true`) instead of '*', since a literal '*' is invalid
+  // alongside credentials and would be rejected by browsers.
+  const allowedOrigins = process.env.FRONTEND_URL?.split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
+
   app.enableCors({
-    origin: process.env.FRONTEND_URL || '*',
+    origin: allowedOrigins?.length ? allowedOrigins : true,
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
     credentials: true,
   });

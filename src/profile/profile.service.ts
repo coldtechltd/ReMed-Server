@@ -1,7 +1,7 @@
 import { BadRequestException, Inject, Injectable, NotFoundException } from '@nestjs/common';
 import { eq } from 'drizzle-orm';
 import { ConditionService } from '../condition/condition.service';
-import { profiles } from '../db/schema';
+import { profiles, countries } from '../db/schema';
 import { CreateProfileDto } from './dto/create-profile.dto';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 
@@ -35,16 +35,17 @@ export class ProfileService {
   }
 
   async getProfile(userId: string) {
-    const [profile] = await this.db
-      .select()
+    const [row] = await this.db
+      .select({ profile: profiles, countryName: countries.name })
       .from(profiles)
+      .leftJoin(countries, eq(profiles.countryId, countries.id))
       .where(eq(profiles.userId, userId));
 
-    if (!profile) {
+    if (!row) {
       throw new NotFoundException('Profile not found');
     }
 
-    return profile;
+    return { ...row.profile, countryName: row.countryName };
   }
 
   async updateProfile(userId: string, dto: UpdateProfileDto) {

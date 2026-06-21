@@ -25,6 +25,9 @@ export const schedules = pgTable('schedules', {
   daysOfWeek: text('days_of_week').array(),
   
   firstDoseAt: timestamp('first_dose_at'),
+  // IANA timezone (e.g. "Africa/Lagos") the specific_times are expressed in,
+  // captured from the user's device. Used to compute correct UTC dose instants.
+  timezone: varchar('timezone', { length: 64 }).default('UTC'),
   asNeeded: boolean('as_needed').default(false),
   isActive: boolean('is_active').default(true),
   createdAt: timestamp('created_at').defaultNow(),

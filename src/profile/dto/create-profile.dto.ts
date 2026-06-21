@@ -1,4 +1,4 @@
-import { IsString, IsOptional, IsNumber, IsDateString, IsNotEmpty } from 'class-validator';
+import { IsString, IsOptional, IsNumber, IsDateString, IsNotEmpty, IsUUID } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 
 export class CreateProfileDto {
@@ -38,7 +38,7 @@ export class CreateProfileDto {
   gender?: string;
 
   @ApiProperty({ description: 'Country ID', example: 'd3b07384-d9a3-4b6a-8b1e-2f3b4c5d6e7f' })
-  @IsString()
+  @IsUUID()
   @IsNotEmpty()
   countryId: string;
 

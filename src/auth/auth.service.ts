@@ -6,7 +6,7 @@ import {
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
 
 import { Inject } from '@nestjs/common';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { users, profiles } from '../db/schema';
 import * as bcrypt from 'bcrypt';
 import { JwtService } from '@nestjs/jwt';
@@ -38,6 +38,14 @@ export class AuthService {
     await this.db
       .update(users)
       .set({ expoPushToken: pushToken })
+      .where(eq(users.id, userId));
+  }
+
+  // Invalidate all existing tokens for this user by incrementing tokenVersion.
+  async logout(userId: string) {
+    await this.db
+      .update(users)
+      .set({ tokenVersion: sql`${users.tokenVersion} + 1` })
       .where(eq(users.id, userId));
   }
 

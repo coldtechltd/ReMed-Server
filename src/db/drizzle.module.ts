@@ -14,6 +14,11 @@ export const DRIZZLE_CLIENT = 'DRIZZLE_CLIENT';
         const pool = new Pool({
           connectionString: process.env.DATABASE_URL,
         });
+        
+        pool.on('error', (err, client) => {
+          console.error('Unexpected error on idle client', err);
+        });
+
         return drizzle(pool, { schema });
       },
     },

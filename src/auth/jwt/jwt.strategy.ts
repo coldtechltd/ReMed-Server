@@ -1,11 +1,16 @@
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { PassportStrategy } from '@nestjs/passport';
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { eq } from 'drizzle-orm';
+import { users } from '../../db/schema';
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
-  constructor(private configService: ConfigService) {
+  constructor(
+    private configService: ConfigService,
+    @Inject('DRIZZLE_CLIENT') private db: any,
+  ) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
       ignoreExpiration: false,
@@ -14,6 +19,20 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
   }
 
   async validate(payload: any) {
-    return { id: payload.sub, email: payload.email };
+    const [user] = await this.db
+      .select()
+      .from(users)
+      .where(eq(users.id, payload.sub));
+
+    if (!user) {
+      throw new UnauthorizedException('User no longer exists');
+    }
+
+    // Reject tokens issued before the most recent logout/revocation.
+    if ((user.tokenVersion ?? 0) !== (payload.tokenVersion ?? 0)) {
+      throw new UnauthorizedException('Token has been revoked');
+    }
+
+    return { id: user.id, email: user.email };
   }
 }

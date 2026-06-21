@@ -4,7 +4,9 @@ import { eq, and, inArray } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { CreateMedicationDto } from './dto/create-medication.dto';
 import { UpdateMedicationDto } from './dto/update-medication.dto';
+import { CreateFullMedicationDto } from './dto/create-full-medication.dto';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
+import { computeDoseEventTimes } from '../schedule/schedule.util';
 
 @Injectable()
 export class MedicationService {
@@ -12,6 +14,72 @@ export class MedicationService {
     @Inject(DRIZZLE_CLIENT)
     private readonly db: NodePgDatabase<typeof schema>,
   ) {}
+
+  /**
+   * Create a medication together with all its dosage forms, schedules, and the
+   * initial dose events — atomically. Either the whole tree is persisted or
+   * nothing is, so a mid-way failure can't leave an orphaned half-medication.
+   */
+  async createFull(userId: string, dto: CreateFullMedicationDto) {
+    return this.db.transaction(async (tx) => {
+      const [medication] = await tx
+        .insert(schema.medications)
+        .values({
+          userId,
+          name: dto.name,
+          notes: dto.notes,
+          startDate: new Date(dto.startDate),
+          endDate: dto.endDate ? new Date(dto.endDate) : null,
+        })
+        .returning();
+
+      for (const df of dto.dosageForms) {
+        const [form] = await tx
+          .insert(schema.dosageForms)
+          .values({
+            medicationId: medication.id,
+            name: df.name,
+            type: df.type,
+            dosageAmount: df.dosageAmount,
+            dosageUnit: df.dosageUnit,
+            route: df.route,
+          })
+          .returning();
+
+        for (const sch of df.schedules) {
+          const tz = sch.timezone ?? 'UTC';
+          const [schedule] = await tx
+            .insert(schema.schedules)
+            .values({
+              dosageFormId: form.id,
+              type: sch.type,
+              intervalValue: sch.intervalValue,
+              intervalUnit: sch.intervalUnit,
+              specificTimes: sch.specificTimes,
+              daysOfWeek: sch.daysOfWeek,
+              firstDoseAt: sch.firstDoseAt ? new Date(sch.firstDoseAt) : null,
+              timezone: tz,
+              asNeeded: sch.asNeeded ?? false,
+              isActive: sch.isActive ?? true,
+            })
+            .returning();
+
+          const times = computeDoseEventTimes(sch, tz);
+          if (times.length > 0) {
+            await tx.insert(schema.doseEvents).values(
+              times.map((time) => ({
+                scheduleId: schedule.id,
+                scheduledFor: time,
+                status: 'pending',
+              })),
+            );
+          }
+        }
+      }
+
+      return medication;
+    });
+  }
 
   async create(userId: string, createMedicationDto: CreateMedicationDto) {
     const [medication] = await this.db

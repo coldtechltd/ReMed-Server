@@ -7,8 +7,15 @@ import {
   IsBoolean,
   IsArray,
   IsDateString,
+  IsIn,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+
+export const SCHEDULE_TYPES = [
+  'interval',
+  'specific_times',
+  'as_needed',
+] as const;
 
 export class CreateScheduleDto {
   @ApiProperty({ description: 'The dosage form ID this schedule belongs to' })
@@ -19,8 +26,7 @@ export class CreateScheduleDto {
   @ApiProperty({
     description: 'Schedule type: interval, specific_times, as_needed',
   })
-  @IsString()
-  @IsNotEmpty()
+  @IsIn(SCHEDULE_TYPES)
   type: string;
 
   @ApiPropertyOptional({ description: 'For interval type, e.g. every 8 hours' })
@@ -55,6 +61,14 @@ export class CreateScheduleDto {
   @IsOptional()
   @IsDateString()
   firstDoseAt?: string;
+
+  @ApiPropertyOptional({
+    description: 'IANA timezone the specific times are expressed in',
+    example: 'Africa/Lagos',
+  })
+  @IsOptional()
+  @IsString()
+  timezone?: string;
 
   @ApiPropertyOptional({ description: 'Is PRN (as needed)?' })
   @IsOptional()
