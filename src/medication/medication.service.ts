@@ -43,6 +43,8 @@ export class MedicationService {
             dosageAmount: df.dosageAmount,
             dosageUnit: df.dosageUnit,
             route: df.route,
+            quantityOnHand: df.quantityOnHand,
+            refillThreshold: df.refillThreshold,
           })
           .returning();
 

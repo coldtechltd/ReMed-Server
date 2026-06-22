@@ -38,6 +38,19 @@ export class DoseEventController {
     return this.doseEventService.findEventsByDate(req.user.id, date);
   }
 
+  @Get('stats')
+  @ApiOperation({
+    summary:
+      'Adherence stats for the current user (rate, streaks, per-day and per-medication breakdown)',
+  })
+  getStats(
+    @Request() req,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+  ) {
+    return this.doseEventService.getStats(req.user.id, from, to);
+  }
+
   @Get(':id')
   @ApiOperation({ summary: 'Get a specific dose event by id' })
   findOne(@Request() req, @Param('id') id: string) {

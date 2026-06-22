@@ -9,6 +9,7 @@ import {
   IsIn,
   ArrayMinSize,
   ValidateNested,
+  Min,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
@@ -87,6 +88,18 @@ export class FullDosageFormDto {
   @IsOptional()
   @IsString()
   route?: string;
+
+  @ApiPropertyOptional({ description: 'Current stock on hand (units)' })
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  quantityOnHand?: number;
+
+  @ApiPropertyOptional({ description: 'Alert at/below this stock. Default: 5' })
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  refillThreshold?: number;
 
   @ApiProperty({ type: [FullScheduleDto] })
   @IsArray()

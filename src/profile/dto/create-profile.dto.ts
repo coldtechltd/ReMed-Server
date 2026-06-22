@@ -51,4 +51,19 @@ export class CreateProfileDto {
   @IsOptional()
   @IsString()
   diagnosedWith?: string;
+
+  @ApiProperty({ description: 'Known allergies', example: 'Penicillin, peanuts', required: false })
+  @IsOptional()
+  @IsString()
+  allergies?: string;
+
+  @ApiProperty({ description: 'Emergency contact name', example: 'Jane Doe', required: false })
+  @IsOptional()
+  @IsString()
+  emergencyContactName?: string;
+
+  @ApiProperty({ description: 'Emergency contact phone', example: '+1234567890', required: false })
+  @IsOptional()
+  @IsString()
+  emergencyContactPhone?: string;
 }

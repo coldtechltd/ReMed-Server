@@ -33,6 +33,8 @@ export class DosageFormService {
         dosageAmount: createDto.dosageAmount,
         dosageUnit: createDto.dosageUnit,
         route: createDto.route,
+        quantityOnHand: createDto.quantityOnHand,
+        refillThreshold: createDto.refillThreshold,
       })
       .returning();
 
@@ -87,6 +89,13 @@ export class DosageFormService {
       updateData.dosageAmount = updateDto.dosageAmount;
     if (updateDto.dosageUnit) updateData.dosageUnit = updateDto.dosageUnit;
     if (updateDto.route) updateData.route = updateDto.route;
+    if (updateDto.quantityOnHand !== undefined) {
+      updateData.quantityOnHand = updateDto.quantityOnHand;
+      // Re-arm the low-stock alert when the user restocks above threshold.
+      updateData.lowStockAlertSent = false;
+    }
+    if (updateDto.refillThreshold !== undefined)
+      updateData.refillThreshold = updateDto.refillThreshold;
 
     if (Object.keys(updateData).length === 0) return existing;
 

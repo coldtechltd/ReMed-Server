@@ -4,6 +4,7 @@ import {
   IsInt,
   IsOptional,
   IsUUID,
+  Min,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
@@ -41,4 +42,20 @@ export class CreateDosageFormDto {
   @IsOptional()
   @IsString()
   route?: string;
+
+  @ApiPropertyOptional({
+    description: 'Current stock on hand (units). Omit to not track refills.',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  quantityOnHand?: number;
+
+  @ApiPropertyOptional({
+    description: 'Alert when stock falls to or below this. Default: 5',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  refillThreshold?: number;
 }

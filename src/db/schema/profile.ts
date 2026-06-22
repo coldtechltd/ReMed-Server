@@ -26,5 +26,8 @@ export const profiles = pgTable('profiles', {
     .notNull(),
   phoneNumber: varchar('phone_number', { length: 20 }).notNull(),
   diagnosedWith: varchar('diagnosed_with', { length: 255 }),
+  allergies: varchar('allergies', { length: 500 }),
+  emergencyContactName: varchar('emergency_contact_name', { length: 255 }),
+  emergencyContactPhone: varchar('emergency_contact_phone', { length: 20 }),
   createdAt: timestamp('created_at').defaultNow(),
 });

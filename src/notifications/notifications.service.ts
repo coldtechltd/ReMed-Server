@@ -1,7 +1,7 @@
 import { Injectable, Inject, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { eq, and, lte, inArray } from 'drizzle-orm';
+import { eq, and, lte, inArray, isNotNull } from 'drizzle-orm';
 import { Expo, ExpoPushMessage, ExpoPushTicket } from 'expo-server-sdk';
 import * as schema from '../db/schema';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
@@ -84,31 +84,10 @@ export class NotificationsService {
 
       if (messages.length === 0) return;
 
-      const chunks = this.expo.chunkPushNotifications(messages);
-      // Only mark events whose ticket actually came back 'ok'. messages and
-      // eventIdsToUpdate are index-aligned; track an offset across chunks so a
-      // failed chunk doesn't shift the mapping.
-      const sentEventIds: string[] = [];
-      let offset = 0;
-
-      for (const chunk of chunks) {
-        try {
-          const ticketChunk = await this.expo.sendPushNotificationsAsync(chunk);
-          ticketChunk.forEach((ticket: ExpoPushTicket, i) => {
-            const eventId = eventIdsToUpdate[offset + i];
-            if (ticket.status === 'ok') {
-              sentEventIds.push(eventId);
-            } else {
-              this.logger.error(
-                `Push ticket error for event ${eventId}: ${ticket.message}`,
-              );
-            }
-          });
-        } catch (error) {
-          this.logger.error('Error sending push notifications', error);
-        }
-        offset += chunk.length;
-      }
+      // Only mark events whose ticket actually came back 'ok'; results are
+      // index-aligned with messages / eventIdsToUpdate.
+      const results = await this.sendPush(messages);
+      const sentEventIds = eventIdsToUpdate.filter((_, i) => results[i]);
 
       // Mark successfully-delivered events so they aren't re-sent. Failed ones
       // stay pending and will be retried on the next cron tick.
@@ -128,5 +107,113 @@ export class NotificationsService {
         this.logger.error(`Database error during reminder check: ${error.message || error}`);
       }
     }
+  }
+
+  // Once a day, alert users whose tracked stock has fallen to or below their
+  // refill threshold. lowStockAlertSent prevents repeat alerts every day until
+  // they restock (resetting the flag happens in DosageFormService.update).
+  @Cron(CronExpression.EVERY_DAY_AT_9AM)
+  async handleRefillReminders() {
+    this.logger.debug('Checking for medications that need a refill...');
+
+    try {
+      const lowForms = await this.db
+        .select({
+          form: schema.dosageForms,
+          medication: schema.medications,
+          user: schema.users,
+        })
+        .from(schema.dosageForms)
+        .innerJoin(
+          schema.medications,
+          eq(schema.dosageForms.medicationId, schema.medications.id),
+        )
+        .innerJoin(schema.users, eq(schema.medications.userId, schema.users.id))
+        .where(
+          and(
+            isNotNull(schema.dosageForms.quantityOnHand),
+            eq(schema.dosageForms.lowStockAlertSent, false),
+            lte(
+              schema.dosageForms.quantityOnHand,
+              schema.dosageForms.refillThreshold,
+            ),
+          ),
+        );
+
+      if (lowForms.length === 0) return;
+
+      const messages: ExpoPushMessage[] = [];
+      const formIdsToUpdate: string[] = [];
+
+      for (const row of lowForms) {
+        if (!row.user.expoPushToken) continue;
+        if (!Expo.isExpoPushToken(row.user.expoPushToken)) {
+          this.logger.error(
+            `Push token ${row.user.expoPushToken} is not a valid Expo push token`,
+          );
+          continue;
+        }
+
+        messages.push({
+          to: row.user.expoPushToken,
+          sound: 'default',
+          title: `Running low on ${row.form.name}`,
+          body: `${row.form.quantityOnHand} ${row.form.dosageUnit} left for ${row.medication.name}. Time to refill.`,
+          data: { dosageFormId: row.form.id, type: 'refill' },
+        });
+        formIdsToUpdate.push(row.form.id);
+      }
+
+      if (messages.length === 0) return;
+
+      const results = await this.sendPush(messages);
+      const sentFormIds = formIdsToUpdate.filter((_, i) => results[i]);
+
+      if (sentFormIds.length > 0) {
+        await this.db
+          .update(schema.dosageForms)
+          .set({ lowStockAlertSent: true })
+          .where(inArray(schema.dosageForms.id, sentFormIds));
+      }
+
+      this.logger.log(`Sent ${sentFormIds.length} refill reminders.`);
+    } catch (error: any) {
+      const code = error?.cause?.code;
+      if (code === 'ETIMEDOUT' || code === 'ENOTFOUND' || code === 'XX000') {
+        this.logger.warn(
+          `Database unavailable during refill check (${code}). Retrying tomorrow.`,
+        );
+      } else {
+        this.logger.error(
+          `Database error during refill check: ${error.message || error}`,
+        );
+      }
+    }
+  }
+
+  // Shared Expo send: chunks messages, sends them, and returns a boolean[]
+  // index-aligned with the input indicating which messages were accepted.
+  private async sendPush(messages: ExpoPushMessage[]): Promise<boolean[]> {
+    const results: boolean[] = new Array(messages.length).fill(false);
+    const chunks = this.expo.chunkPushNotifications(messages);
+    let offset = 0;
+
+    for (const chunk of chunks) {
+      try {
+        const ticketChunk = await this.expo.sendPushNotificationsAsync(chunk);
+        ticketChunk.forEach((ticket: ExpoPushTicket, i) => {
+          if (ticket.status === 'ok') {
+            results[offset + i] = true;
+          } else {
+            this.logger.error(`Push ticket error: ${ticket.message}`);
+          }
+        });
+      } catch (error) {
+        this.logger.error('Error sending push notifications', error);
+      }
+      offset += chunk.length;
+    }
+
+    return results;
   }
 }

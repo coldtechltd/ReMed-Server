@@ -15,6 +15,20 @@
       "when": 1775735729202,
       "tag": "0001_whole_firebrand",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1782080520903,
+      "tag": "0002_quick_strong_guy",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1782081326761,
+      "tag": "0003_grey_stellaris",
+      "breakpoints": true
     }
   ]
 }
