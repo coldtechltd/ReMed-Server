@@ -1,4 +1,3 @@
-
 import {
   pgTable,
   uuid,
@@ -23,7 +22,7 @@ export const schedules = pgTable('schedules', {
   specificTimes: text('specific_times').array(),
   // For specific days (e.g. ["Mon", "Wed", "Fri"])
   daysOfWeek: text('days_of_week').array(),
-  
+
   firstDoseAt: timestamp('first_dose_at'),
   // IANA timezone (e.g. "Africa/Lagos") the specific_times are expressed in,
   // captured from the user's device. Used to compute correct UTC dose instants.

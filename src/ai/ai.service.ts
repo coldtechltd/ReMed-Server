@@ -101,7 +101,7 @@ export class AiService {
     const messages: Groq.Chat.ChatCompletionMessageParam[] = [
       { role: 'system', content: systemContent },
       ...safeHistory.slice(-10).map((m) => ({
-        role: m.role as 'user' | 'assistant',
+        role: m.role,
         content: m.content,
       })),
       { role: 'user', content: message },

@@ -33,9 +33,16 @@ export class DoseEventController {
   }
 
   @Get('by-date')
-  @ApiOperation({ summary: 'Get dose events for a specific date' })
-  findEventsByDate(@Request() req, @Query('date') date: string) {
-    return this.doseEventService.findEventsByDate(req.user.id, date);
+  @ApiOperation({
+    summary:
+      'Get dose events for a specific date (optionally interpreted in an IANA timezone)',
+  })
+  findEventsByDate(
+    @Request() req,
+    @Query('date') date: string,
+    @Query('tz') tz?: string,
+  ) {
+    return this.doseEventService.findEventsByDate(req.user.id, date, tz);
   }
 
   @Get('stats')

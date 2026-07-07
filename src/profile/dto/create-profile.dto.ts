@@ -1,4 +1,11 @@
-import { IsString, IsOptional, IsNumber, IsDateString, IsNotEmpty, IsUUID } from 'class-validator';
+import {
+  IsString,
+  IsOptional,
+  IsNumber,
+  IsDateString,
+  IsNotEmpty,
+  IsUUID,
+} from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 
 export class CreateProfileDto {
@@ -7,7 +14,11 @@ export class CreateProfileDto {
   @IsNotEmpty()
   fullName: string;
 
-  @ApiProperty({ description: 'Date of birth', example: '1990-01-01', required: false })
+  @ApiProperty({
+    description: 'Date of birth',
+    example: '1990-01-01',
+    required: false,
+  })
   @IsOptional()
   @IsDateString()
   dateOfBirth?: string;
@@ -37,7 +48,10 @@ export class CreateProfileDto {
   @IsString()
   gender?: string;
 
-  @ApiProperty({ description: 'Country ID', example: 'd3b07384-d9a3-4b6a-8b1e-2f3b4c5d6e7f' })
+  @ApiProperty({
+    description: 'Country ID',
+    example: 'd3b07384-d9a3-4b6a-8b1e-2f3b4c5d6e7f',
+  })
   @IsUUID()
   @IsNotEmpty()
   countryId: string;
@@ -47,22 +61,38 @@ export class CreateProfileDto {
   @IsNotEmpty()
   phoneNumber: string;
 
-  @ApiProperty({ description: 'Any diagnosed conditions', example: 'Hypertension', required: false })
+  @ApiProperty({
+    description: 'Any diagnosed conditions',
+    example: 'Hypertension',
+    required: false,
+  })
   @IsOptional()
   @IsString()
   diagnosedWith?: string;
 
-  @ApiProperty({ description: 'Known allergies', example: 'Penicillin, peanuts', required: false })
+  @ApiProperty({
+    description: 'Known allergies',
+    example: 'Penicillin, peanuts',
+    required: false,
+  })
   @IsOptional()
   @IsString()
   allergies?: string;
 
-  @ApiProperty({ description: 'Emergency contact name', example: 'Jane Doe', required: false })
+  @ApiProperty({
+    description: 'Emergency contact name',
+    example: 'Jane Doe',
+    required: false,
+  })
   @IsOptional()
   @IsString()
   emergencyContactName?: string;
 
-  @ApiProperty({ description: 'Emergency contact phone', example: '+1234567890', required: false })
+  @ApiProperty({
+    description: 'Emergency contact phone',
+    example: '+1234567890',
+    required: false,
+  })
   @IsOptional()
   @IsString()
   emergencyContactPhone?: string;

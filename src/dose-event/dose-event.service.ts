@@ -10,6 +10,7 @@ import * as schema from '../db/schema';
 import { UpdateDoseEventDto } from './dto/update-dose-event.dto';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
 import { ScheduleService } from '../schedule/schedule.service';
+import { zonedTimeToUtc } from '../schedule/schedule.util';
 
 @Injectable()
 export class DoseEventService {
@@ -91,12 +92,21 @@ export class DoseEventService {
     }));
   }
 
-  async findEventsByDate(userId: string, dateStr: string) {
-    const targetDate = new Date(dateStr);
-    const startOfDay = new Date(targetDate);
-    startOfDay.setHours(0, 0, 0, 0);
-    const endOfDay = new Date(targetDate);
-    endOfDay.setHours(23, 59, 59, 999);
+  async findEventsByDate(userId: string, dateStr: string, tz?: string) {
+    // With a tz, "the day" is the user's calendar day, not the server's —
+    // otherwise doses near midnight land on the wrong date in the app.
+    let startOfDay: Date;
+    let endOfDay: Date;
+    const dayBounds = tz ? this.dayBoundsInTz(dateStr, tz) : null;
+    if (dayBounds) {
+      ({ startOfDay, endOfDay } = dayBounds);
+    } else {
+      const targetDate = new Date(dateStr);
+      startOfDay = new Date(targetDate);
+      startOfDay.setHours(0, 0, 0, 0);
+      endOfDay = new Date(targetDate);
+      endOfDay.setHours(23, 59, 59, 999);
+    }
 
     const results = await this.db
       .select({
@@ -133,6 +143,28 @@ export class DoseEventService {
       dosageForm: r.dosageForm,
       medication: r.medication,
     }));
+  }
+
+  /**
+   * UTC bounds of the calendar day `dateStr` (YYYY-MM-DD) in IANA zone `tz`.
+   * Returns null for a malformed date or unknown timezone so the caller can
+   * fall back to server-local bounds instead of 500ing.
+   */
+  private dayBoundsInTz(
+    dateStr: string,
+    tz: string,
+  ): { startOfDay: Date; endOfDay: Date } | null {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return null;
+    const [y, m, d] = dateStr.split('-').map(Number);
+    try {
+      const startOfDay = zonedTimeToUtc(y, m - 1, d, 0, 0, tz);
+      const endOfDay = new Date(
+        zonedTimeToUtc(y, m - 1, d, 23, 59, tz).getTime() + 59_999,
+      );
+      return { startOfDay, endOfDay };
+    } catch {
+      return null; // invalid IANA timezone
+    }
   }
 
   async getStats(userId: string, fromStr?: string, toStr?: string) {
@@ -241,7 +273,10 @@ export class DoseEventService {
     let prev: Date | null = null;
     for (const date of [...adherentDays].sort()) {
       const d = new Date(date);
-      if (prev && (d.getTime() - prev.getTime()) / (24 * 60 * 60 * 1000) === 1) {
+      if (
+        prev &&
+        (d.getTime() - prev.getTime()) / (24 * 60 * 60 * 1000) === 1
+      ) {
         run++;
       } else {
         run = 1;

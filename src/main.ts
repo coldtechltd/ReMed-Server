@@ -13,9 +13,7 @@ async function bootstrap() {
   // Initialize Sentry
   Sentry.init({
     dsn: process.env.SENTRY_DSN,
-    integrations: [
-      nodeProfilingIntegration(),
-    ],
+    integrations: [nodeProfilingIntegration()],
     tracesSampleRate: 1.0,
     profilesSampleRate: 1.0,
   });
@@ -61,7 +59,9 @@ async function bootstrap() {
   const port = process.env.PORT ?? 3002;
   await app.listen(port);
   logger.log(`Server started on http://localhost:${port}`);
-  logger.log(`Swagger documentation available on http://localhost:${port}/docs`);
+  logger.log(
+    `Swagger documentation available on http://localhost:${port}/docs`,
+  );
 }
 
 bootstrap();

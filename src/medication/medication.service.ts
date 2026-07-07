@@ -6,13 +6,14 @@ import { CreateMedicationDto } from './dto/create-medication.dto';
 import { UpdateMedicationDto } from './dto/update-medication.dto';
 import { CreateFullMedicationDto } from './dto/create-full-medication.dto';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
-import { computeDoseEventTimes } from '../schedule/schedule.util';
+import { DoseEventGeneratorService } from '../schedule/dose-event-generator.service';
 
 @Injectable()
 export class MedicationService {
   constructor(
     @Inject(DRIZZLE_CLIENT)
     private readonly db: NodePgDatabase<typeof schema>,
+    private readonly doseEventGenerator: DoseEventGeneratorService,
   ) {}
 
   /**
@@ -66,16 +67,11 @@ export class MedicationService {
             })
             .returning();
 
-          const times = computeDoseEventTimes(sch, tz);
-          if (times.length > 0) {
-            await tx.insert(schema.doseEvents).values(
-              times.map((time) => ({
-                scheduleId: schedule.id,
-                scheduledFor: time,
-                status: 'pending',
-              })),
-            );
-          }
+          await this.doseEventGenerator.generateForSchedule(
+            schedule,
+            { startDate: medication.startDate, endDate: medication.endDate },
+            tx,
+          );
         }
       }
 
@@ -154,6 +150,27 @@ export class MedicationService {
         ),
       )
       .returning();
+
+    // Course dates bound event generation, so a changed startDate/endDate must
+    // rebuild every schedule's future events: shrinking the course drops
+    // now-out-of-range doses, extending it fills the horizon back in.
+    if (updateMedicationDto.startDate || updateMedicationDto.endDate) {
+      const scheduleRows = await this.db
+        .select({ schedule: schema.schedules })
+        .from(schema.schedules)
+        .innerJoin(
+          schema.dosageForms,
+          eq(schema.schedules.dosageFormId, schema.dosageForms.id),
+        )
+        .where(eq(schema.dosageForms.medicationId, id));
+
+      for (const row of scheduleRows) {
+        await this.doseEventGenerator.regenerateForSchedule(row.schedule, {
+          startDate: updatedMedication.startDate,
+          endDate: updatedMedication.endDate,
+        });
+      }
+    }
 
     return updatedMedication;
   }

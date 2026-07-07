@@ -1,7 +1,7 @@
 import { Injectable, Inject, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { eq, and, lte, inArray, isNotNull } from 'drizzle-orm';
+import { eq, and, gte, lte, inArray, isNotNull } from 'drizzle-orm';
 import { Expo, ExpoPushMessage, ExpoPushTicket } from 'expo-server-sdk';
 import * as schema from '../db/schema';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
@@ -22,6 +22,10 @@ export class NotificationsService {
   async handleReminders() {
     this.logger.debug('Checking for pending dose events to send reminders...');
     const now = new Date();
+    // Doses more than 2h past due (the auto-missed grace window) are stale —
+    // after server downtime they should be marked missed by the hourly cron,
+    // not blasted out as a burst of confusing late reminders.
+    const staleCutoff = new Date(now.getTime() - 2 * 60 * 60 * 1000);
 
     try {
       const pendingDoses = await this.db
@@ -51,6 +55,7 @@ export class NotificationsService {
             eq(schema.doseEvents.reminderSent, false),
             eq(schema.schedules.isActive, true),
             lte(schema.doseEvents.scheduledFor, now),
+            gte(schema.doseEvents.scheduledFor, staleCutoff),
           ),
         );
 
@@ -102,9 +107,13 @@ export class NotificationsService {
     } catch (error: any) {
       const code = error?.cause?.code;
       if (code === 'ETIMEDOUT' || code === 'ENOTFOUND' || code === 'XX000') {
-        this.logger.warn(`Database unavailable during reminder check (${code}). Retrying next minute.`);
+        this.logger.warn(
+          `Database unavailable during reminder check (${code}). Retrying next minute.`,
+        );
       } else {
-        this.logger.error(`Database error during reminder check: ${error.message || error}`);
+        this.logger.error(
+          `Database error during reminder check: ${error.message || error}`,
+        );
       }
     }
   }

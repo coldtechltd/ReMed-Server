@@ -8,13 +8,16 @@ import {
 } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { eq, and, gte, lte } from 'drizzle-orm';
+import { eq, and, lte } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { CreateScheduleDto } from './dto/create-schedule.dto';
 import { UpdateScheduleDto } from './dto/update-schedule.dto';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
 import { DosageFormService } from '../dosage-form/dosage-form.service';
-import { computeDoseEventTimes } from './schedule.util';
+import {
+  DoseEventGeneratorService,
+  MedicationBounds,
+} from './dose-event-generator.service';
 
 @Injectable()
 export class ScheduleService {
@@ -24,7 +27,27 @@ export class ScheduleService {
     @Inject(DRIZZLE_CLIENT)
     private readonly db: NodePgDatabase<typeof schema>,
     private readonly dosageFormService: DosageFormService,
+    private readonly doseEventGenerator: DoseEventGeneratorService,
   ) {}
+
+  /** startDate/endDate of the medication owning a dosage form. */
+  private async medicationBoundsForDosageForm(
+    dosageFormId: string,
+  ): Promise<MedicationBounds> {
+    const [row] = await this.db
+      .select({
+        startDate: schema.medications.startDate,
+        endDate: schema.medications.endDate,
+      })
+      .from(schema.dosageForms)
+      .innerJoin(
+        schema.medications,
+        eq(schema.dosageForms.medicationId, schema.medications.id),
+      )
+      .where(eq(schema.dosageForms.id, dosageFormId))
+      .limit(1);
+    return row ?? {};
+  }
 
   async create(userId: string, createDto: CreateScheduleDto) {
     // Ensure user owns dosage form
@@ -66,11 +89,10 @@ export class ScheduleService {
       })
       .returning();
 
-    await this.generateInitialDoseEvents(
-      schedule.id,
-      createDto,
-      schedule.timezone ?? 'UTC',
+    const bounds = await this.medicationBoundsForDosageForm(
+      schedule.dosageFormId,
     );
+    await this.doseEventGenerator.generateForSchedule(schedule, bounds);
 
     return schedule;
   }
@@ -145,6 +167,14 @@ export class ScheduleService {
       .where(eq(schema.schedules.id, id))
       .returning();
 
+    // Any field above changes when/whether doses occur, so rebuild the future:
+    // drop upcoming pending events (history and snoozed doses are preserved)
+    // and regenerate from the new rules. Deactivating clears without regen.
+    const bounds = await this.medicationBoundsForDosageForm(
+      updated.dosageFormId,
+    );
+    await this.doseEventGenerator.regenerateForSchedule(updated, bounds);
+
     return updated;
   }
 
@@ -164,47 +194,6 @@ export class ScheduleService {
     });
   }
 
-  private async generateInitialDoseEvents(
-    scheduleId: string,
-    payload: CreateScheduleDto,
-    timezone: string = 'UTC',
-  ) {
-    const now = new Date();
-    const startOfDay = new Date(now);
-    startOfDay.setHours(0, 0, 0, 0);
-    const limit = new Date(now.getTime() + 24 * 60 * 60 * 1000); // 24 hours ahead
-
-    // Timezone-aware computation of the dose instants (shared with the atomic
-    // medication-create path).
-    const eventTimes = computeDoseEventTimes(payload, timezone, now);
-    if (eventTimes.length === 0) return;
-
-    // Fetch already-existing scheduledFor times for this schedule in the window
-    // to prevent duplicate inserts on repeated runs (e.g. the daily cron).
-    const existing = await this.db
-      .select({ scheduledFor: schema.doseEvents.scheduledFor })
-      .from(schema.doseEvents)
-      .where(
-        and(
-          eq(schema.doseEvents.scheduleId, scheduleId),
-          gte(schema.doseEvents.scheduledFor, startOfDay),
-          lte(schema.doseEvents.scheduledFor, limit),
-        ),
-      );
-    const existingMs = new Set(existing.map((e) => e.scheduledFor.getTime()));
-
-    const newTimes = eventTimes.filter((t) => !existingMs.has(t.getTime()));
-    if (newTimes.length > 0) {
-      await this.db.insert(schema.doseEvents).values(
-        newTimes.map((time) => ({
-          scheduleId,
-          scheduledFor: time,
-          status: 'pending',
-        })),
-      );
-    }
-  }
-
   /**
    * Logs DB connectivity failures (pooler/network/timeout) as warnings instead
    * of letting them bubble up as unhandled cron exceptions. Re-throws anything
@@ -218,29 +207,40 @@ export class ScheduleService {
       );
       return;
     }
-    this.logger.error(
-      `Error during ${context}: ${error?.message || error}`,
-    );
+    this.logger.error(`Error during ${context}: ${error?.message || error}`);
   }
 
   @Cron(CronExpression.EVERY_DAY_AT_MIDNIGHT)
   async handleDailyDoseEventGeneration() {
     this.logger.log('Running daily dose event generation...');
     try {
-      const activeSchedules = await this.db
-        .select()
+      // Medication start/end dates bound the generated window, so join them in.
+      const rows = await this.db
+        .select({
+          schedule: schema.schedules,
+          startDate: schema.medications.startDate,
+          endDate: schema.medications.endDate,
+        })
         .from(schema.schedules)
+        .innerJoin(
+          schema.dosageForms,
+          eq(schema.schedules.dosageFormId, schema.dosageForms.id),
+        )
+        .innerJoin(
+          schema.medications,
+          eq(schema.dosageForms.medicationId, schema.medications.id),
+        )
         .where(eq(schema.schedules.isActive, true));
 
-      for (const schedule of activeSchedules) {
-        await this.generateInitialDoseEvents(
-          schedule.id,
-          schedule as any,
-          schedule.timezone ?? 'UTC',
+      let inserted = 0;
+      for (const row of rows) {
+        inserted += await this.doseEventGenerator.generateForSchedule(
+          row.schedule,
+          { startDate: row.startDate, endDate: row.endDate },
         );
       }
       this.logger.log(
-        `Finished daily dose event generation for ${activeSchedules.length} schedules.`,
+        `Finished daily dose event generation for ${rows.length} schedules (${inserted} new events).`,
       );
     } catch (error) {
       this.handleCronDbError('daily dose event generation', error);

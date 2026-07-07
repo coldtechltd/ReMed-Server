@@ -27,7 +27,7 @@ export class AuditInterceptor implements NestInterceptor {
       '/reminder',
     ];
 
-    const isSensitive = sensitiveResources.some(res => url.includes(res));
+    const isSensitive = sensitiveResources.some((res) => url.includes(res));
 
     return next.handle().pipe(
       tap(() => {
