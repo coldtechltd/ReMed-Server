@@ -2,7 +2,7 @@ import { Body, Controller, Post, Request, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
-import { AiService } from './ai.service';
+import { AiService, PendingMedicationAction } from './ai.service';
 import { ChatDto } from './dto/chat.dto';
 
 // Groq calls cost money — cap usage at 20 requests / minute per IP.
@@ -23,12 +23,15 @@ export class AiController {
 
   @Post('chat')
   @ApiOperation({ summary: 'Chat with the wellness assistant' })
-  async chat(@Request() req, @Body() dto: ChatDto): Promise<{ reply: string }> {
-    const reply = await this.aiService.chat(
+  async chat(
+    @Request() req,
+    @Body() dto: ChatDto,
+  ): Promise<{ reply: string; pendingAction?: PendingMedicationAction }> {
+    return this.aiService.chat(
       req.user.id,
       dto.message,
       dto.history,
+      dto.timezone,
     );
-    return { reply };
   }
 }

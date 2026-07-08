@@ -3,7 +3,6 @@ import {
   Inject,
   NotFoundException,
   ForbiddenException,
-  BadRequestException,
   Logger,
 } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
@@ -18,6 +17,7 @@ import {
   DoseEventGeneratorService,
   MedicationBounds,
 } from './dose-event-generator.service';
+import { assertValidScheduleTypeFields } from './schedule.util';
 
 @Injectable()
 export class ScheduleService {
@@ -54,22 +54,7 @@ export class ScheduleService {
     await this.dosageFormService.findOne(createDto.dosageFormId, userId);
 
     // Validate type constraints
-    if (
-      createDto.type === 'interval' &&
-      (!createDto.intervalValue || !createDto.intervalUnit)
-    ) {
-      throw new BadRequestException(
-        'Interval schedule requires intervalValue and intervalUnit',
-      );
-    }
-    if (
-      createDto.type === 'specific_times' &&
-      !createDto.specificTimes?.length
-    ) {
-      throw new BadRequestException(
-        'Specific times schedule requires specificTimes array',
-      );
-    }
+    assertValidScheduleTypeFields(createDto);
 
     const [schedule] = await this.db
       .insert(schema.schedules)

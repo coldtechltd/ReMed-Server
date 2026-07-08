@@ -4,6 +4,8 @@
  * MedicationService (atomic multi-drug create) so the logic lives in one place.
  */
 
+import { BadRequestException } from '@nestjs/common';
+
 export interface SchedulePayload {
   type: string;
   intervalValue?: number | null;
@@ -206,4 +208,29 @@ export function computeDoseEventTimes(
       return true;
     })
     .slice(0, MAX_EVENTS_PER_GENERATION);
+}
+
+/**
+ * Checks that a schedule payload carries the fields its own `type` requires
+ * (interval needs intervalValue+intervalUnit, specific_times needs a
+ * non-empty specificTimes array) — shared by ScheduleService.create and the
+ * AI medication-creation tool so both paths reject malformed schedules the
+ * same way instead of silently generating zero dose events.
+ */
+export function assertValidScheduleTypeFields(sch: {
+  type: string;
+  intervalValue?: number | null;
+  intervalUnit?: string | null;
+  specificTimes?: string[] | null;
+}): void {
+  if (sch.type === 'interval' && (!sch.intervalValue || !sch.intervalUnit)) {
+    throw new BadRequestException(
+      'Interval schedule requires intervalValue and intervalUnit',
+    );
+  }
+  if (sch.type === 'specific_times' && !sch.specificTimes?.length) {
+    throw new BadRequestException(
+      'Specific times schedule requires specificTimes array',
+    );
+  }
 }
