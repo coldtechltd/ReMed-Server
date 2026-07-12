@@ -1,4 +1,5 @@
 export * from './user';
+export * from './device-session';
 export * from './country';
 export * from './condition';
 export * from './profile';

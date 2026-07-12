@@ -6,8 +6,8 @@ import {
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
 
 import { Inject } from '@nestjs/common';
-import { eq, sql } from 'drizzle-orm';
-import { users, profiles } from '../db/schema';
+import { and, eq, sql } from 'drizzle-orm';
+import { users, profiles, deviceSessions } from '../db/schema';
 import * as bcrypt from 'bcrypt';
 import { JwtService } from '@nestjs/jwt';
 import { RegisterDto } from './dto/register.dto';
@@ -34,19 +34,58 @@ export class AuthService {
     return user;
   }
 
-  async updatePushToken(userId: string, pushToken: string) {
-    await this.db
-      .update(users)
-      .set({ expoPushToken: pushToken })
-      .where(eq(users.id, userId));
+  // Creates (or touches) the session row for this specific device, so push
+  // tokens and logout are scoped per-device instead of clobbering/affecting
+  // every device the user is signed into.
+  async upsertDeviceSession(
+    userId: string,
+    deviceId: string,
+    pushToken?: string,
+  ) {
+    const [existing] = await this.db
+      .select()
+      .from(deviceSessions)
+      .where(
+        and(
+          eq(deviceSessions.userId, userId),
+          eq(deviceSessions.deviceId, deviceId),
+        ),
+      );
+
+    if (existing) {
+      const updates: Record<string, unknown> = { lastSeenAt: new Date() };
+      if (pushToken) updates.expoPushToken = pushToken;
+      const [session] = await this.db
+        .update(deviceSessions)
+        .set(updates)
+        .where(eq(deviceSessions.id, existing.id))
+        .returning();
+      return session;
+    }
+
+    const [session] = await this.db
+      .insert(deviceSessions)
+      .values({ userId, deviceId, expoPushToken: pushToken })
+      .returning();
+    return session;
   }
 
-  // Invalidate all existing tokens for this user by incrementing tokenVersion.
-  async logout(userId: string) {
+  async updatePushToken(userId: string, deviceId: string, pushToken: string) {
+    return this.upsertDeviceSession(userId, deviceId, pushToken);
+  }
+
+  // Invalidate only this device's tokens by bumping its own tokenVersion —
+  // other devices the user is signed into keep working.
+  async logout(userId: string, deviceId: string) {
     await this.db
-      .update(users)
-      .set({ tokenVersion: sql`${users.tokenVersion} + 1` })
-      .where(eq(users.id, userId));
+      .update(deviceSessions)
+      .set({ tokenVersion: sql`${deviceSessions.tokenVersion} + 1` })
+      .where(
+        and(
+          eq(deviceSessions.userId, userId),
+          eq(deviceSessions.deviceId, deviceId),
+        ),
+      );
   }
 
   async hasUserProfile(userId: string): Promise<boolean> {
@@ -58,7 +97,7 @@ export class AuthService {
   }
 
   // ---------------- REGISTER ------------------
-  async register(registerDto: RegisterDto) {
+  async register(registerDto: RegisterDto, deviceId: string) {
     const { email, password } = registerDto;
 
     const [existing] = await this.db
@@ -80,7 +119,8 @@ export class AuthService {
       })
       .returning();
 
-    return this.generateTokens(newUser, false);
+    const session = await this.upsertDeviceSession(newUser.id, deviceId);
+    return this.generateTokens(newUser, false, session);
   }
 
   // ---------------- GOOGLE LOGIN ------------------
@@ -110,11 +150,16 @@ export class AuthService {
   }
 
   // ---------------- TOKENS ------------------
-  generateTokens(user: any, hasProfile: boolean) {
+  generateTokens(
+    user: any,
+    hasProfile: boolean,
+    session: { deviceId: string; tokenVersion: number },
+  ) {
     const payload = {
       sub: user.id,
       email: user.email,
-      tokenVersion: user.tokenVersion,
+      deviceId: session.deviceId,
+      tokenVersion: session.tokenVersion,
     };
 
     const accessToken = this.jwt.sign(payload, { expiresIn: '7d' });

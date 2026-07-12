@@ -28,12 +28,15 @@ export class NotificationsService {
     const staleCutoff = new Date(now.getTime() - 2 * 60 * 60 * 1000);
 
     try {
+      // Joined against deviceSessions (not users) so a user signed into
+      // several devices gets the reminder on all of them, not just whichever
+      // device last overwrote a single shared push token.
       const pendingDoses = await this.db
         .select({
           event: schema.doseEvents,
           medication: schema.medications,
           dosageForm: schema.dosageForms,
-          user: schema.users,
+          device: schema.deviceSessions,
         })
         .from(schema.doseEvents)
         .innerJoin(
@@ -48,7 +51,10 @@ export class NotificationsService {
           schema.medications,
           eq(schema.dosageForms.medicationId, schema.medications.id),
         )
-        .innerJoin(schema.users, eq(schema.medications.userId, schema.users.id))
+        .innerJoin(
+          schema.deviceSessions,
+          eq(schema.medications.userId, schema.deviceSessions.userId),
+        )
         .where(
           and(
             eq(schema.doseEvents.status, 'pending'),
@@ -56,6 +62,7 @@ export class NotificationsService {
             eq(schema.schedules.isActive, true),
             lte(schema.doseEvents.scheduledFor, now),
             gte(schema.doseEvents.scheduledFor, staleCutoff),
+            isNotNull(schema.deviceSessions.expoPushToken),
           ),
         );
 
@@ -64,19 +71,19 @@ export class NotificationsService {
       }
 
       const messages: ExpoPushMessage[] = [];
-      const eventIdsToUpdate: string[] = [];
+      const eventIdPerMessage: string[] = [];
 
       for (const dose of pendingDoses) {
-        if (!dose.user.expoPushToken) continue;
-        if (!Expo.isExpoPushToken(dose.user.expoPushToken)) {
+        const pushToken = dose.device.expoPushToken;
+        if (!Expo.isExpoPushToken(pushToken)) {
           this.logger.error(
-            `Push token ${dose.user.expoPushToken} is not a valid Expo push token`,
+            `Push token ${pushToken} is not a valid Expo push token`,
           );
           continue;
         }
 
         messages.push({
-          to: dose.user.expoPushToken,
+          to: pushToken,
           sound: 'default',
           title: `Time to take ${dose.medication.name}`,
           body: `${dose.dosageForm.dosageAmount} ${dose.dosageForm.dosageUnit} of ${dose.dosageForm.name}`,
@@ -84,15 +91,19 @@ export class NotificationsService {
           categoryId: 'dose_reminder',
         });
 
-        eventIdsToUpdate.push(dose.event.id);
+        eventIdPerMessage.push(dose.event.id);
       }
 
       if (messages.length === 0) return;
 
       // Only mark events whose ticket actually came back 'ok'; results are
-      // index-aligned with messages / eventIdsToUpdate.
+      // index-aligned with messages / eventIdPerMessage. A dose can appear
+      // once per device, so dedupe before updating — one delivered ticket is
+      // enough to mark the event as reminded.
       const results = await this.sendPush(messages);
-      const sentEventIds = eventIdsToUpdate.filter((_, i) => results[i]);
+      const sentEventIds = [
+        ...new Set(eventIdPerMessage.filter((_, i) => results[i])),
+      ];
 
       // Mark successfully-delivered events so they aren't re-sent. Failed ones
       // stay pending and will be retried on the next cron tick.
@@ -130,14 +141,17 @@ export class NotificationsService {
         .select({
           form: schema.dosageForms,
           medication: schema.medications,
-          user: schema.users,
+          device: schema.deviceSessions,
         })
         .from(schema.dosageForms)
         .innerJoin(
           schema.medications,
           eq(schema.dosageForms.medicationId, schema.medications.id),
         )
-        .innerJoin(schema.users, eq(schema.medications.userId, schema.users.id))
+        .innerJoin(
+          schema.deviceSessions,
+          eq(schema.medications.userId, schema.deviceSessions.userId),
+        )
         .where(
           and(
             isNotNull(schema.dosageForms.quantityOnHand),
@@ -146,37 +160,40 @@ export class NotificationsService {
               schema.dosageForms.quantityOnHand,
               schema.dosageForms.refillThreshold,
             ),
+            isNotNull(schema.deviceSessions.expoPushToken),
           ),
         );
 
       if (lowForms.length === 0) return;
 
       const messages: ExpoPushMessage[] = [];
-      const formIdsToUpdate: string[] = [];
+      const formIdPerMessage: string[] = [];
 
       for (const row of lowForms) {
-        if (!row.user.expoPushToken) continue;
-        if (!Expo.isExpoPushToken(row.user.expoPushToken)) {
+        const pushToken = row.device.expoPushToken;
+        if (!Expo.isExpoPushToken(pushToken)) {
           this.logger.error(
-            `Push token ${row.user.expoPushToken} is not a valid Expo push token`,
+            `Push token ${pushToken} is not a valid Expo push token`,
           );
           continue;
         }
 
         messages.push({
-          to: row.user.expoPushToken,
+          to: pushToken,
           sound: 'default',
           title: `Running low on ${row.form.name}`,
           body: `${row.form.quantityOnHand} ${row.form.dosageUnit} left for ${row.medication.name}. Time to refill.`,
           data: { dosageFormId: row.form.id, type: 'refill' },
         });
-        formIdsToUpdate.push(row.form.id);
+        formIdPerMessage.push(row.form.id);
       }
 
       if (messages.length === 0) return;
 
       const results = await this.sendPush(messages);
-      const sentFormIds = formIdsToUpdate.filter((_, i) => results[i]);
+      const sentFormIds = [
+        ...new Set(formIdPerMessage.filter((_, i) => results[i])),
+      ];
 
       if (sentFormIds.length > 0) {
         await this.db

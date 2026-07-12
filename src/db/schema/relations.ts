@@ -1,5 +1,6 @@
 import { relations } from 'drizzle-orm';
 import { users } from './user';
+import { deviceSessions } from './device-session';
 import { profiles } from './profile';
 import { medications } from './medication';
 import { dosageForms } from './dosageForm';
@@ -13,6 +14,14 @@ export const usersRelations = relations(users, ({ one, many }) => ({
     references: [profiles.userId],
   }),
   medications: many(medications),
+  deviceSessions: many(deviceSessions),
+}));
+
+export const deviceSessionsRelations = relations(deviceSessions, ({ one }) => ({
+  user: one(users, {
+    fields: [deviceSessions.userId],
+    references: [users.id],
+  }),
 }));
 
 export const profilesRelations = relations(profiles, ({ one }) => ({
