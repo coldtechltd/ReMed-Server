@@ -91,11 +91,20 @@ export class DosageFormService {
     if (updateDto.route) updateData.route = updateDto.route;
     if (updateDto.quantityOnHand !== undefined) {
       updateData.quantityOnHand = updateDto.quantityOnHand;
-      // Re-arm the low-stock alert when the user restocks above threshold.
-      updateData.lowStockAlertSent = false;
+      // Re-arm the predictive refill reminder: the stock count just changed, so
+      // whatever we last projected (and alerted on) is stale.
+      updateData.refillReminderSentAt = null;
     }
     if (updateDto.refillThreshold !== undefined)
       updateData.refillThreshold = updateDto.refillThreshold;
+    // "Remind me later" on a refill notification: dating the latch forward keeps
+    // the daily cron quiet until then (its predicate only fires on a latch older
+    // than 20h, which a future timestamp never satisfies).
+    if (updateDto.snoozeRefillDays !== undefined) {
+      updateData.refillReminderSentAt = new Date(
+        Date.now() + updateDto.snoozeRefillDays * 24 * 60 * 60 * 1000,
+      );
+    }
 
     if (Object.keys(updateData).length === 0) return existing;
 

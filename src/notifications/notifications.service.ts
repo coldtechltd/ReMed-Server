@@ -1,10 +1,25 @@
 import { Injectable, Inject, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { eq, and, gte, lte, inArray, isNotNull } from 'drizzle-orm';
+import {
+  eq,
+  and,
+  or,
+  gte,
+  lte,
+  lt,
+  isNull,
+  inArray,
+  isNotNull,
+} from 'drizzle-orm';
 import { Expo, ExpoPushMessage, ExpoPushTicket } from 'expo-server-sdk';
 import * as schema from '../db/schema';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
+import {
+  projectStock,
+  daysUntil,
+  REFILL_LEAD_TIME_DAYS,
+} from '../dosage-form/stock.util';
 
 @Injectable()
 export class NotificationsService {
@@ -60,6 +75,9 @@ export class NotificationsService {
             eq(schema.doseEvents.status, 'pending'),
             eq(schema.doseEvents.reminderSent, false),
             eq(schema.schedules.isActive, true),
+            // Stopped/finished medications owe nothing. Completing one already
+            // clears its upcoming events; this also covers any left behind.
+            eq(schema.medications.status, 'active'),
             lte(schema.doseEvents.scheduledFor, now),
             gte(schema.doseEvents.scheduledFor, staleCutoff),
             isNotNull(schema.deviceSessions.expoPushToken),
@@ -129,63 +147,205 @@ export class NotificationsService {
     }
   }
 
-  // Once a day, alert users whose tracked stock has fallen to or below their
-  // refill threshold. lowStockAlertSent prevents repeat alerts every day until
-  // they restock (resetting the flag happens in DosageFormService.update).
+  /**
+   * Once a day, warn about tracked stock that is about to run out.
+   *
+   * Predictive rather than threshold-based: the run-out date is projected from the
+   * user's actual upcoming doses, so "5 pills left" correctly reads as urgent at
+   * four-a-day and relaxed at one-a-day. `refillThreshold` remains the fallback for
+   * stock that can't be projected (as-needed schedules materialize no dose events).
+   *
+   * `refillReminderSentAt` throttles this to at most one push per form per day, and
+   * `DosageFormService.update` clears it on restock so the next shortfall alerts
+   * again.
+   */
   @Cron(CronExpression.EVERY_DAY_AT_9AM)
   async handleRefillReminders() {
     this.logger.debug('Checking for medications that need a refill...');
 
     try {
-      const lowForms = await this.db
+      const now = new Date();
+      const throttleCutoff = new Date(now.getTime() - 20 * 60 * 60 * 1000);
+      const leadCutoff = new Date(
+        now.getTime() + REFILL_LEAD_TIME_DAYS * 24 * 60 * 60 * 1000,
+      );
+
+      // Candidate forms: stock tracked, medication still being taken, and not
+      // already alerted in the last 20h.
+      const candidates = await this.db
         .select({
           form: schema.dosageForms,
           medication: schema.medications,
-          device: schema.deviceSessions,
         })
         .from(schema.dosageForms)
         .innerJoin(
           schema.medications,
           eq(schema.dosageForms.medicationId, schema.medications.id),
         )
-        .innerJoin(
-          schema.deviceSessions,
-          eq(schema.medications.userId, schema.deviceSessions.userId),
-        )
         .where(
           and(
             isNotNull(schema.dosageForms.quantityOnHand),
-            eq(schema.dosageForms.lowStockAlertSent, false),
-            lte(
-              schema.dosageForms.quantityOnHand,
-              schema.dosageForms.refillThreshold,
+            eq(schema.medications.status, 'active'),
+            or(
+              isNull(schema.dosageForms.refillReminderSentAt),
+              lt(schema.dosageForms.refillReminderSentAt, throttleCutoff),
             ),
+          ),
+        );
+
+      if (candidates.length === 0) return;
+
+      const formIds = candidates.map((c) => c.form.id);
+
+      // Active schedules for those forms. A form whose schedules the user has all
+      // muted is skipped entirely — pushing about a medication they've silenced
+      // isn't wanted.
+      const scheduleRows = await this.db
+        .select({
+          id: schema.schedules.id,
+          dosageFormId: schema.schedules.dosageFormId,
+        })
+        .from(schema.schedules)
+        .where(
+          and(
+            inArray(schema.schedules.dosageFormId, formIds),
+            eq(schema.schedules.isActive, true),
+          ),
+        );
+
+      const formIdBySchedule = new Map(
+        scheduleRows.map((s) => [s.id, s.dosageFormId]),
+      );
+
+      // Upcoming doses, ascending, so each form's supply can be walked forward.
+      const upcoming = scheduleRows.length
+        ? await this.db
+            .select({
+              scheduleId: schema.doseEvents.scheduleId,
+              scheduledFor: schema.doseEvents.scheduledFor,
+            })
+            .from(schema.doseEvents)
+            .where(
+              and(
+                inArray(
+                  schema.doseEvents.scheduleId,
+                  scheduleRows.map((s) => s.id),
+                ),
+                eq(schema.doseEvents.status, 'pending'),
+                gte(schema.doseEvents.scheduledFor, now),
+              ),
+            )
+            .orderBy(schema.doseEvents.scheduledFor)
+        : [];
+
+      const eventsByForm = new Map<string, { scheduledFor: Date }[]>();
+      for (const event of upcoming) {
+        const formId = formIdBySchedule.get(event.scheduleId);
+        if (!formId) continue;
+        const list = eventsByForm.get(formId) ?? [];
+        list.push(event);
+        eventsByForm.set(formId, list);
+      }
+
+      // Decide who needs a reminder before touching push tokens, so the
+      // projection runs once per form rather than once per device.
+      const dueForms = candidates.filter(({ form }) => {
+        const hasActiveSchedule = scheduleRows.some(
+          (s) => s.dosageFormId === form.id,
+        );
+        if (!hasActiveSchedule) return false;
+
+        const events = eventsByForm.get(form.id) ?? [];
+        const { runsOutAt } = projectStock(
+          form.quantityOnHand!,
+          form.dosageAmount,
+          events,
+        );
+
+        if (runsOutAt) {
+          // Warn only while there's still time to act. Once the run-out date has
+          // passed the user is already missing doses, and the missed-dose flow
+          // covers that — re-nagging daily forever wouldn't help.
+          return runsOutAt >= now && runsOutAt <= leadCutoff;
+        }
+        // No projectable run-out (e.g. as-needed): fall back to the threshold.
+        return (
+          events.length === 0 &&
+          form.quantityOnHand! <= (form.refillThreshold ?? 5)
+        );
+      });
+
+      if (dueForms.length === 0) return;
+
+      const devices = await this.db
+        .select()
+        .from(schema.deviceSessions)
+        .where(
+          and(
+            inArray(schema.deviceSessions.userId, [
+              ...new Set(dueForms.map((f) => f.medication.userId)),
+            ]),
             isNotNull(schema.deviceSessions.expoPushToken),
           ),
         );
 
-      if (lowForms.length === 0) return;
+      const devicesByUser = new Map<string, typeof devices>();
+      for (const device of devices) {
+        const list = devicesByUser.get(device.userId) ?? [];
+        list.push(device);
+        devicesByUser.set(device.userId, list);
+      }
 
       const messages: ExpoPushMessage[] = [];
       const formIdPerMessage: string[] = [];
 
-      for (const row of lowForms) {
-        const pushToken = row.device.expoPushToken;
-        if (!Expo.isExpoPushToken(pushToken)) {
-          this.logger.error(
-            `Push token ${pushToken} is not a valid Expo push token`,
-          );
-          continue;
-        }
+      for (const { form, medication } of dueForms) {
+        const events = eventsByForm.get(form.id) ?? [];
+        const { runsOutAt } = projectStock(
+          form.quantityOnHand!,
+          form.dosageAmount,
+          events,
+        );
 
-        messages.push({
-          to: pushToken,
-          sound: 'default',
-          title: `Running low on ${row.form.name}`,
-          body: `${row.form.quantityOnHand} ${row.form.dosageUnit} left for ${row.medication.name}. Time to refill.`,
-          data: { dosageFormId: row.form.id, type: 'refill' },
-        });
-        formIdPerMessage.push(row.form.id);
+        const body = runsOutAt
+          ? (() => {
+              const days = daysUntil(runsOutAt, now);
+              if (days === 0)
+                return `You'll run out of ${medication.name} today.`;
+              if (days === 1)
+                return `You'll run out of ${medication.name} tomorrow.`;
+              return `You'll run out of ${medication.name} in ${days} days.`;
+            })()
+          : `${form.quantityOnHand} ${form.dosageUnit} left for ${medication.name}.`;
+
+        for (const device of devicesByUser.get(medication.userId) ?? []) {
+          const pushToken = device.expoPushToken;
+          if (!Expo.isExpoPushToken(pushToken)) {
+            this.logger.error(
+              `Push token ${pushToken} is not a valid Expo push token`,
+            );
+            continue;
+          }
+
+          messages.push({
+            to: pushToken,
+            sound: 'default',
+            title: `Time to refill ${form.name}`,
+            body,
+            // medicationId is needed too: the app's dosage-form screen takes it
+            // as a route param, so tapping through requires both ids.
+            data: {
+              type: 'refill',
+              dosageFormId: form.id,
+              medicationId: medication.id,
+            },
+            categoryId: 'refill_reminder',
+            // Android: its own channel, so refills can be tuned down without
+            // muting dose reminders (registered in the app's lib/notifications.ts).
+            channelId: 'refill',
+          });
+          formIdPerMessage.push(form.id);
+        }
       }
 
       if (messages.length === 0) return;
@@ -198,11 +358,13 @@ export class NotificationsService {
       if (sentFormIds.length > 0) {
         await this.db
           .update(schema.dosageForms)
-          .set({ lowStockAlertSent: true })
+          .set({ refillReminderSentAt: now })
           .where(inArray(schema.dosageForms.id, sentFormIds));
       }
 
-      this.logger.log(`Sent ${sentFormIds.length} refill reminders.`);
+      this.logger.log(
+        `Sent refill reminders for ${sentFormIds.length} form(s).`,
+      );
     } catch (error: any) {
       const code = error?.cause?.code;
       if (code === 'ETIMEDOUT' || code === 'ENOTFOUND' || code === 'XX000') {

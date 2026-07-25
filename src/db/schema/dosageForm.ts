@@ -4,7 +4,6 @@ import {
   varchar,
   integer,
   timestamp,
-  boolean,
 } from 'drizzle-orm/pg-core';
 import { medications } from './medication';
 
@@ -19,7 +18,9 @@ export const dosageForms = pgTable('dosage_forms', {
   dosageUnit: varchar('dosage_unit', { length: 50 }).default('pills'),
   route: varchar('route', { length: 100 }).default('oral'),
   quantityOnHand: integer('quantity_on_hand'), // null = stock not tracked
-  refillThreshold: integer('refill_threshold').default(5), // alert at/below this
-  lowStockAlertSent: boolean('low_stock_alert_sent').default(false),
+  refillThreshold: integer('refill_threshold').default(5), // fallback when stock can't be projected
+  // Latch stopping the daily refill cron from re-alerting every morning. Re-armed
+  // (set back to null) whenever the user updates quantityOnHand, i.e. restocks.
+  refillReminderSentAt: timestamp('refill_reminder_sent_at'),
   createdAt: timestamp('created_at').defaultNow(),
 });

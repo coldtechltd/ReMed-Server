@@ -36,6 +36,20 @@
       "when": 1783867174808,
       "tag": "0004_famous_kid_colt",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1785012559291,
+      "tag": "0005_omniscient_black_bolt",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1785012572068,
+      "tag": "0006_conscious_roland_deschain",
+      "breakpoints": true
     }
   ]
 }

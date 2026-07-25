@@ -19,6 +19,12 @@ type DrizzleExecutor =
 export interface MedicationBounds {
   startDate?: Date | null;
   endDate?: Date | null;
+  /**
+   * Medication lifecycle status. A completed medication generates nothing, so
+   * editing a schedule under one can't resurrect its doses. Callers that project
+   * bounds out of the medications table should select this too.
+   */
+  status?: string | null;
 }
 
 export interface ScheduleLike extends SchedulePayload {
@@ -82,6 +88,10 @@ export class DoseEventGeneratorService {
   ): Promise<number> {
     if (schedule.asNeeded || schedule.type === 'as_needed') return 0;
     if (schedule.isActive === false) return 0;
+    // A stopped/finished medication owes no further doses. Guarding here rather
+    // than only in the callers' WHERE clauses means no edit path — schedule
+    // create/update, medication PATCH, the nightly top-up — can resurrect them.
+    if (bounds.status === 'completed') return 0;
 
     const tz = schedule.timezone ?? 'UTC';
     const window = this.generationWindow(schedule, bounds);
@@ -120,11 +130,16 @@ export class DoseEventGeneratorService {
    * history is untouched, and snoozed doses (snoozeCount > 0) survive — they
    * represent an already-notified dose the user deferred, which is still owed
    * even if the timing rules change.
+   *
+   * `includeSnoozed` is the one exception, used when a medication is stopped or
+   * finished: the treatment is over, so a deferred dose is no longer owed and
+   * would otherwise linger in the user's upcoming list indefinitely.
    */
   async clearFuturePending(
     scheduleIds: string[],
     dbc: DrizzleExecutor = this.db,
     now: Date = new Date(),
+    opts: { includeSnoozed?: boolean } = {},
   ): Promise<void> {
     if (scheduleIds.length === 0) return;
     await dbc
@@ -134,7 +149,9 @@ export class DoseEventGeneratorService {
           inArray(schema.doseEvents.scheduleId, scheduleIds),
           eq(schema.doseEvents.status, 'pending'),
           gt(schema.doseEvents.scheduledFor, now),
-          eq(schema.doseEvents.snoozeCount, 0),
+          ...(opts.includeSnoozed
+            ? []
+            : [eq(schema.doseEvents.snoozeCount, 0)]),
         ),
       );
   }

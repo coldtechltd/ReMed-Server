@@ -9,11 +9,14 @@ import {
   IsIn,
   ArrayMinSize,
   ValidateNested,
+  ValidateIf,
   Min,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { SCHEDULE_TYPES } from '../../schedule/dto/create-schedule.dto';
+import { MEDICATION_TYPES } from './create-medication.dto';
+import type { MedicationType } from './create-medication.dto';
 
 export class FullScheduleDto {
   @ApiProperty({ description: 'interval | specific_times | as_needed' })
@@ -120,14 +123,31 @@ export class CreateFullMedicationDto {
   @IsString()
   notes?: string;
 
+  @ApiPropertyOptional({
+    enum: MEDICATION_TYPES,
+    description:
+      '"continuous" (indefinite, no end date) or "course" (bounded, endDate required). ' +
+      'Derived from the presence of endDate when omitted.',
+  })
+  @IsOptional()
+  @IsIn(MEDICATION_TYPES)
+  type?: MedicationType;
+
   @ApiProperty()
   @IsDateString()
   @IsNotEmpty()
   startDate: string;
 
-  @ApiPropertyOptional()
-  @IsOptional()
+  @ApiPropertyOptional({
+    description:
+      'Required when type is "course"; stored as null when type is "continuous".',
+  })
+  @ValidateIf(
+    (dto: CreateFullMedicationDto) =>
+      dto.type === 'course' || dto.endDate != null,
+  )
   @IsDateString()
+  @IsNotEmpty()
   endDate?: string;
 
   @ApiProperty({ type: [FullDosageFormDto] })

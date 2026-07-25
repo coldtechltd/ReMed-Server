@@ -30,7 +30,7 @@ export class ScheduleService {
     private readonly doseEventGenerator: DoseEventGeneratorService,
   ) {}
 
-  /** startDate/endDate of the medication owning a dosage form. */
+  /** startDate/endDate/status of the medication owning a dosage form. */
   private async medicationBoundsForDosageForm(
     dosageFormId: string,
   ): Promise<MedicationBounds> {
@@ -38,6 +38,7 @@ export class ScheduleService {
       .select({
         startDate: schema.medications.startDate,
         endDate: schema.medications.endDate,
+        status: schema.medications.status,
       })
       .from(schema.dosageForms)
       .innerJoin(
@@ -205,6 +206,7 @@ export class ScheduleService {
           schedule: schema.schedules,
           startDate: schema.medications.startDate,
           endDate: schema.medications.endDate,
+          status: schema.medications.status,
         })
         .from(schema.schedules)
         .innerJoin(
@@ -215,13 +217,24 @@ export class ScheduleService {
           schema.medications,
           eq(schema.dosageForms.medicationId, schema.medications.id),
         )
-        .where(eq(schema.schedules.isActive, true));
+        // Completed medications would generate nothing anyway (the generator
+        // guards on status); filtering here stops us re-querying them nightly.
+        .where(
+          and(
+            eq(schema.schedules.isActive, true),
+            eq(schema.medications.status, 'active'),
+          ),
+        );
 
       let inserted = 0;
       for (const row of rows) {
         inserted += await this.doseEventGenerator.generateForSchedule(
           row.schedule,
-          { startDate: row.startDate, endDate: row.endDate },
+          {
+            startDate: row.startDate,
+            endDate: row.endDate,
+            status: row.status,
+          },
         );
       }
       this.logger.log(

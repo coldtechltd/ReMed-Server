@@ -1,9 +1,10 @@
 import { Injectable, Inject } from '@nestjs/common';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { eq, and, or, isNull, gte, inArray } from 'drizzle-orm';
+import { eq, and, inArray } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
 import { localDateParts } from '../schedule/schedule.util';
+import { projectStock } from '../dosage-form/stock.util';
 
 function formatDate(date: Date, timezone: string): string {
   const { year, month0, day } = localDateParts(date, timezone);
@@ -50,10 +51,7 @@ export class MedicationContextService {
       .where(
         and(
           eq(schema.medications.userId, userId),
-          or(
-            isNull(schema.medications.endDate),
-            gte(schema.medications.endDate, now),
-          ),
+          eq(schema.medications.status, 'active'),
         ),
       );
 
@@ -135,26 +133,28 @@ export class MedicationContextService {
         if (events.length === 0) {
           stockDesc = `${form.quantityOnHand} ${form.dosageUnit ?? 'units'} on hand, no upcoming doses scheduled`;
         } else {
-          let remaining = form.quantityOnHand;
-          let runOutEvent: (typeof events)[number] | null = null;
-          for (const ev of events) {
-            remaining -= form.dosageAmount;
-            if (remaining < 0) {
-              runOutEvent = ev;
-              break;
-            }
-          }
-          if (runOutEvent) {
-            stockDesc = `${form.quantityOnHand} ${form.dosageUnit ?? 'units'} on hand, estimated to run out by ${formatDate(runOutEvent.scheduledFor, timezone)} — refill needed before then`;
+          const { runsOutAt, coveredThrough } = projectStock(
+            form.quantityOnHand,
+            form.dosageAmount,
+            events,
+          );
+          if (runsOutAt) {
+            stockDesc = `${form.quantityOnHand} ${form.dosageUnit ?? 'units'} on hand, estimated to run out by ${formatDate(runsOutAt, timezone)} — refill needed before then`;
           } else {
-            const last = events[events.length - 1];
-            stockDesc = `${form.quantityOnHand} ${form.dosageUnit ?? 'units'} on hand, sufficient through at least ${formatDate(last.scheduledFor, timezone)}`;
+            stockDesc = `${form.quantityOnHand} ${form.dosageUnit ?? 'units'} on hand, sufficient through at least ${formatDate(coveredThrough!, timezone)}`;
           }
         }
       }
 
+      const courseDesc =
+        medication.type === 'course'
+          ? medication.endDate
+            ? `treatment course through ${formatDate(medication.endDate, timezone)}`
+            : 'treatment course'
+          : 'ongoing medication';
+
       lines.push(
-        `- ${medication.name} — ${form.name} (${form.dosageAmount} ${form.dosageUnit ?? 'units'}, ${scheduleDesc}). ${stockDesc}.`,
+        `- ${medication.name} (${courseDesc}) — ${form.name} (${form.dosageAmount} ${form.dosageUnit ?? 'units'}, ${scheduleDesc}). ${stockDesc}.`,
       );
     }
 

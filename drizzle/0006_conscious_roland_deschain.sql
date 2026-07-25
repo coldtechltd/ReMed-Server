@@ -1,0 +1,1 @@
+ALTER TABLE "dosage_forms" DROP COLUMN "low_stock_alert_sent";
