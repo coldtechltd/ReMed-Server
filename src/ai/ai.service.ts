@@ -54,11 +54,23 @@ export interface PendingMedicationAction {
   args: CreateMedicationArgsDto;
 }
 
+// Groq validates the model's generated arguments against this schema before
+// handing them back, and llama-3.3 habitually emits an explicit `null` for
+// every optional field it isn't using rather than omitting the key. A bare
+// `type: 'string'` therefore fails validation with `tool_use_failed`, so every
+// non-required field accepts null and the nulls are stripped in `stripNulls`.
 const MEDICATION_TOOL_PARAMETERS = {
   type: 'object',
   properties: {
-    name: { type: 'string', description: 'Medication name, e.g. "Metformin"' },
-    notes: { type: 'string', description: 'Optional free-text notes' },
+    name: {
+      type: 'string',
+      description:
+        'The medication name exactly as the user gave it, e.g. "Metformin". Never invent a placeholder such as "Medication" — if the user has not said the name yet, ask them instead of calling this tool.',
+    },
+    notes: {
+      type: ['string', 'null'],
+      description: 'Optional free-text notes',
+    },
     startDate: {
       type: 'string',
       description:
@@ -81,52 +93,53 @@ const MEDICATION_TOOL_PARAMETERS = {
     },
     dosageAmount: { type: 'integer', description: 'Quantity per dose, e.g. 1' },
     dosageUnit: {
-      type: 'string',
+      type: ['string', 'null'],
       description: 'Unit, e.g. "tablet", "ml". Default "pills".',
     },
     route: {
-      type: 'string',
+      type: ['string', 'null'],
       description: 'Route of administration, e.g. "oral". Default "oral".',
     },
     quantityOnHand: {
-      type: 'integer',
+      type: ['integer', 'null'],
       description:
-        'Current stock the user has on hand, if mentioned. Omit if unknown.',
+        'Current stock the user has on hand, if mentioned. Null if unknown.',
     },
     refillThreshold: {
-      type: 'integer',
-      description: 'Alert threshold. Omit to use the default (5).',
+      type: ['integer', 'null'],
+      description: 'Alert threshold. Null to use the default (5).',
     },
     scheduleType: {
       type: 'string',
       enum: ['interval', 'specific_times', 'as_needed'],
     },
     intervalValue: {
-      type: 'integer',
-      description: 'Required if scheduleType is "interval", e.g. 8',
+      type: ['integer', 'null'],
+      description:
+        'Required if scheduleType is "interval", e.g. 8. Null otherwise.',
     },
     intervalUnit: {
-      type: 'string',
-      enum: ['minutes', 'hours', 'days'],
-      description: 'Required if scheduleType is "interval"',
+      type: ['string', 'null'],
+      enum: ['minutes', 'hours', 'days', null],
+      description: 'Required if scheduleType is "interval". Null otherwise.',
     },
     specificTimes: {
-      type: 'array',
+      type: ['array', 'null'],
       items: { type: 'string' },
       description:
-        'Required if scheduleType is "specific_times". 24h "HH:MM" strings, e.g. ["08:00", "20:00"]',
+        'Required if scheduleType is "specific_times". 24h "HH:MM" strings, e.g. ["08:00", "20:00"]. Null otherwise.',
     },
     daysOfWeek: {
-      type: 'array',
+      type: ['array', 'null'],
       items: { type: 'string' },
       description:
-        'Optional days filter, e.g. ["Mon", "Wed", "Fri"]. Omit for every day.',
+        'Optional days filter, e.g. ["Mon", "Wed", "Fri"]. Null for every day.',
     },
     firstDoseAt: {
-      type: 'string',
+      type: ['string', 'null'],
       description: 'Optional ISO datetime of the first dose',
     },
-    asNeeded: { type: 'boolean' },
+    asNeeded: { type: ['boolean', 'null'] },
   },
   required: [
     'name',
@@ -162,6 +175,24 @@ interface ToolResult {
   status: 'ok' | 'error';
   message: string;
   medicationId?: string;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+/**
+ * Digs the raw generation out of a Groq `tool_use_failed` error. The SDK puts
+ * the parsed response body on `err.error`, and Groq nests the details one
+ * level deeper under `error` — tolerate both shapes.
+ */
+function extractFailedGeneration(err: unknown): string | undefined {
+  const body = asRecord(asRecord(err)?.error);
+  const candidate =
+    asRecord(body?.error)?.failed_generation ?? body?.failed_generation;
+  return typeof candidate === 'string' ? candidate : undefined;
 }
 
 @Injectable()
@@ -265,18 +296,32 @@ export class AiService {
       { role: 'user', content: message },
     ];
 
-    const completion = await this.groq.chat.completions.create({
-      model: MODEL,
-      messages,
-      tools: MEDICATION_TOOLS,
-      tool_choice: 'auto',
-      parallel_tool_calls: false,
-      temperature: 0.6,
-      max_tokens: 300,
-    });
+    let choice: Groq.Chat.ChatCompletionMessage | undefined;
+    let toolCall: Groq.Chat.ChatCompletionMessageToolCall | undefined;
 
-    const choice = completion.choices[0]?.message;
-    const toolCall = choice?.tool_calls?.[0];
+    try {
+      const completion = await this.groq.chat.completions.create({
+        model: MODEL,
+        messages,
+        tools: MEDICATION_TOOLS,
+        tool_choice: 'auto',
+        parallel_tool_calls: false,
+        temperature: 0.6,
+        max_tokens: 300,
+      });
+      choice = completion.choices[0]?.message;
+      toolCall = choice?.tool_calls?.[0];
+    } catch (err) {
+      // Groq rejects the whole request with `tool_use_failed` when the model's
+      // generated arguments don't match the tool schema, but hands back the
+      // raw generation — recover the call from it rather than 500-ing.
+      toolCall = this.recoverToolCall(err);
+      if (!toolCall) {
+        return {
+          reply: 'Sorry, I had trouble with that one — could you say it again?',
+        };
+      }
+    }
 
     if (!toolCall) {
       return {
@@ -289,10 +334,9 @@ export class AiService {
 
     let args: Record<string, any>;
     try {
-      args = JSON.parse(toolCall.function.arguments || '{}') as Record<
-        string,
-        any
-      >;
+      args = this.stripNulls(
+        JSON.parse(toolCall.function.arguments || '{}') as Record<string, any>,
+      );
     } catch {
       return {
         reply:
@@ -387,19 +431,28 @@ export class AiService {
       },
     ];
 
-    const followUp = await this.groq.chat.completions.create({
-      model: MODEL,
-      messages: followUpMessages,
-      temperature: 0.6,
-      max_tokens: 250,
-    });
-
-    const reply = this.stripStructuredOutput(
-      followUp.choices[0]?.message?.content,
+    const fallbackReply =
       toolResult.status === 'ok'
-        ? 'All set — just confirm below and I’ll add it.'
-        : toolResult.message,
-    );
+        ? toolCall.function.name === 'propose_medication'
+          ? 'Here are the details — confirm below and I’ll add it.'
+          : 'All set, I’ve added it to your reminders.'
+        : toolResult.message;
+
+    let followUpContent: string | null = null;
+    try {
+      const followUp = await this.groq.chat.completions.create({
+        model: MODEL,
+        messages: followUpMessages,
+        temperature: 0.6,
+        max_tokens: 250,
+      });
+      followUpContent = followUp.choices[0]?.message?.content ?? null;
+    } catch {
+      // The medication was already proposed/created above — losing the
+      // wording of the confirmation shouldn't lose the action itself.
+    }
+
+    const reply = this.stripStructuredOutput(followUpContent, fallbackReply);
 
     return {
       reply,
@@ -408,6 +461,51 @@ export class AiService {
         toolResult.status === 'ok'
           ? pendingAction
           : undefined,
+    };
+  }
+
+  /**
+   * Drops keys the model set to an explicit `null`. The tool schema has to
+   * accept null (llama emits it for every unused optional field), but the
+   * validators and DTO downstream expect those keys to simply be absent.
+   */
+  private stripNulls(args: Record<string, any>): Record<string, any> {
+    return Object.fromEntries(
+      Object.entries(args).filter(([, value]) => value !== null),
+    );
+  }
+
+  /**
+   * Groq returns HTTP 400 `tool_use_failed` when the model's generated tool
+   * arguments don't validate, embedding the raw generation as
+   * `<function=name>{...}</function>` in `error.error.failed_generation`.
+   * Parse that back into a tool call so a schema hiccup degrades into a normal
+   * turn instead of a 500. Returns undefined if nothing usable is in there.
+   */
+  private recoverToolCall(
+    err: unknown,
+  ): Groq.Chat.ChatCompletionMessageToolCall | undefined {
+    const failedGeneration = extractFailedGeneration(err);
+    if (!failedGeneration) return undefined;
+
+    const match = /<function=([\w-]+)>([\s\S]*)/.exec(failedGeneration);
+    if (!match) return undefined;
+
+    const name = match[1];
+    if (name !== 'propose_medication' && name !== 'create_medication')
+      return undefined;
+
+    const rawArgs = match[2].replace(/<\/function>\s*$/, '').trim();
+    try {
+      JSON.parse(rawArgs);
+    } catch {
+      return undefined;
+    }
+
+    return {
+      id: `recovered_${Date.now()}`,
+      type: 'function',
+      function: { name, arguments: rawArgs },
     };
   }
 
