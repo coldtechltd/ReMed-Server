@@ -21,10 +21,28 @@ import {
   REFILL_LEAD_TIME_DAYS,
 } from '../dosage-form/stock.util';
 
+// A ticket only says Expo accepted the message; whether FCM/APNs actually
+// delivered it shows up minutes later in the receipt. Expo asks for a wait
+// before the first lookup, and keeps receipts around for 24h.
+const RECEIPT_CHECK_DELAY_MS = 5 * 60 * 1000;
+const RECEIPT_GIVE_UP_MS = 60 * 60 * 1000;
+// Guard against unbounded growth if the receipt API is down for a long stretch.
+const MAX_PENDING_RECEIPTS = 5000;
+
+interface PendingReceipt {
+  ticketId: string;
+  /** Kept so a DeviceNotRegistered receipt can be traced back to its device. */
+  pushToken: string;
+  queuedAt: number;
+}
+
 @Injectable()
 export class NotificationsService {
   private expo: Expo;
   private readonly logger = new Logger(NotificationsService.name);
+  // In memory on purpose: receipts are a diagnostic, not state worth a table.
+  // A restart loses at most one window of them.
+  private pendingReceipts: PendingReceipt[] = [];
 
   constructor(
     @Inject(DRIZZLE_CLIENT)
@@ -107,6 +125,13 @@ export class NotificationsService {
           body: `${dose.dosageForm.dosageAmount} ${dose.dosageForm.dosageUnit} of ${dose.dosageForm.name}`,
           data: { eventId: dose.event.id },
           categoryId: 'dose_reminder',
+          // Android needs both of these or a dose reminder arrives late and
+          // silently: without an explicit channelId it lands on expo's fallback
+          // "Miscellaneous" channel instead of the MAX-importance `default`
+          // channel the app registers (so no heads-up), and without high
+          // priority FCM holds it until the device leaves Doze.
+          channelId: 'default',
+          priority: 'high',
         });
 
         eventIdPerMessage.push(dose.event.id);
@@ -381,6 +406,8 @@ export class NotificationsService {
 
   // Shared Expo send: chunks messages, sends them, and returns a boolean[]
   // index-aligned with the input indicating which messages were accepted.
+  //
+  // "Accepted" is not "delivered" — see handlePushReceipts below.
   private async sendPush(messages: ExpoPushMessage[]): Promise<boolean[]> {
     const results: boolean[] = new Array(messages.length).fill(false);
     const chunks = this.expo.chunkPushNotifications(messages);
@@ -392,8 +419,11 @@ export class NotificationsService {
         ticketChunk.forEach((ticket: ExpoPushTicket, i) => {
           if (ticket.status === 'ok') {
             results[offset + i] = true;
+            this.queueReceipt(ticket.id, chunk[i].to as string);
           } else {
-            this.logger.error(`Push ticket error: ${ticket.message}`);
+            this.logger.error(
+              `Push ticket error: ${ticket.message} (${ticket.details?.error ?? 'no detail'})`,
+            );
           }
         });
       } catch (error) {
@@ -403,5 +433,97 @@ export class NotificationsService {
     }
 
     return results;
+  }
+
+  private queueReceipt(ticketId: string, pushToken: string) {
+    if (this.pendingReceipts.length >= MAX_PENDING_RECEIPTS) {
+      this.pendingReceipts.shift();
+    }
+    this.pendingReceipts.push({ ticketId, pushToken, queuedAt: Date.now() });
+  }
+
+  /**
+   * Ask Expo what actually happened to the pushes it accepted.
+   *
+   * This exists because a ticket comes back `ok` even when the push later dies
+   * at the FCM/APNs hop — a misconfigured credential can drop every Android
+   * notification while the send logs read as a clean success. The receipt is
+   * the only place that failure is visible, so it gets logged loudly, and a
+   * token the platform has disowned is cleared so we stop pushing into a void.
+   */
+  @Cron(CronExpression.EVERY_10_MINUTES)
+  async handlePushReceipts() {
+    if (this.pendingReceipts.length === 0) return;
+
+    const now = Date.now();
+    const due = this.pendingReceipts.filter(
+      (r) => now - r.queuedAt >= RECEIPT_CHECK_DELAY_MS,
+    );
+    if (due.length === 0) return;
+
+    // Anything not yet due stays queued; due entries are re-queued below only
+    // if Expo doesn't have a receipt for them yet.
+    this.pendingReceipts = this.pendingReceipts.filter(
+      (r) => now - r.queuedAt < RECEIPT_CHECK_DELAY_MS,
+    );
+
+    const tokenByTicket = new Map(due.map((r) => [r.ticketId, r.pushToken]));
+    const stillPending: PendingReceipt[] = [];
+    const deadTokens = new Set<string>();
+
+    for (const idChunk of this.expo.chunkPushNotificationReceiptIds(
+      due.map((r) => r.ticketId),
+    )) {
+      let receipts: Awaited<
+        ReturnType<typeof this.expo.getPushNotificationReceiptsAsync>
+      >;
+      try {
+        receipts = await this.expo.getPushNotificationReceiptsAsync(idChunk);
+      } catch (error) {
+        this.logger.error('Error fetching push receipts', error);
+        // Transient — put them back so the next tick retries.
+        stillPending.push(...due.filter((r) => idChunk.includes(r.ticketId)));
+        continue;
+      }
+
+      for (const ticketId of idChunk) {
+        const receipt = receipts[ticketId];
+
+        if (!receipt) {
+          // Not ready yet. Keep waiting, but not forever.
+          const entry = due.find((r) => r.ticketId === ticketId);
+          if (entry && now - entry.queuedAt < RECEIPT_GIVE_UP_MS) {
+            stillPending.push(entry);
+          }
+          continue;
+        }
+
+        if (receipt.status === 'ok') continue;
+
+        const detail = receipt.details?.error;
+        this.logger.error(
+          `Push delivery failed (${detail ?? 'unknown'}): ${receipt.message}`,
+        );
+
+        if (detail === 'DeviceNotRegistered') {
+          const token = tokenByTicket.get(ticketId);
+          if (token) deadTokens.add(token);
+        }
+      }
+    }
+
+    this.pendingReceipts.push(...stillPending);
+
+    // The app re-registers on next launch, so clearing is safe: it costs at
+    // most one missed reminder on a device that already wasn't receiving them.
+    if (deadTokens.size > 0) {
+      await this.db
+        .update(schema.deviceSessions)
+        .set({ expoPushToken: null })
+        .where(inArray(schema.deviceSessions.expoPushToken, [...deadTokens]));
+      this.logger.warn(
+        `Cleared ${deadTokens.size} push token(s) reported as unregistered.`,
+      );
+    }
   }
 }

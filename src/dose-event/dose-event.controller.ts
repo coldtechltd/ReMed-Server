@@ -7,6 +7,7 @@ import {
   Query,
   UseGuards,
   Request,
+  ParseIntPipe,
 } from '@nestjs/common';
 import { DoseEventService } from './dose-event.service';
 import { UpdateDoseEventDto } from './dto/update-dose-event.dto';
@@ -27,9 +28,23 @@ export class DoseEventController {
   }
 
   @Get('upcoming')
-  @ApiOperation({ summary: 'Get all upcoming pending dose events' })
-  getUpcoming(@Request() req) {
-    return this.doseEventService.getUpcoming(req.user.id);
+  @ApiOperation({
+    summary:
+      'Get upcoming pending dose events, optionally bounded to a window (from/days/limit)',
+  })
+  getUpcoming(
+    @Request() req,
+    @Query('from') from?: string,
+    @Query('days', new ParseIntPipe({ optional: true })) days?: number,
+    @Query('limit', new ParseIntPipe({ optional: true })) limit?: number,
+    @Query('tz') tz?: string,
+  ) {
+    return this.doseEventService.getUpcoming(req.user.id, {
+      from,
+      days,
+      limit,
+      tz,
+    });
   }
 
   @Get('by-date')

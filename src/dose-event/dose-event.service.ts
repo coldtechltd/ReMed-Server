@@ -3,6 +3,7 @@ import {
   Inject,
   NotFoundException,
   ForbiddenException,
+  BadRequestException,
 } from '@nestjs/common';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { eq, lte, gte, and, desc, sql } from 'drizzle-orm';
@@ -55,8 +56,46 @@ export class DoseEventService {
     }));
   }
 
-  async getUpcoming(userId: string) {
-    const results = await this.db
+  async getUpcoming(
+    userId: string,
+    opts?: { from?: string; days?: number; limit?: number; tz?: string },
+  ) {
+    // Optional window. Callers that pass nothing (the app's "N remaining"
+    // badge) keep the original unbounded behaviour; the widget snapshot passes
+    // from/days/limit so it doesn't drag the full 90-day materialization
+    // horizon — hundreds of rows with four nested objects each — over the wire.
+    const conditions = [
+      eq(schema.medications.userId, userId),
+      eq(schema.doseEvents.status, 'pending'),
+      // Neither of these was applied before. In-app that only skewed a badge
+      // count, but a home-screen widget would show a next dose for a paused
+      // schedule or a completed course, and its Take button would PATCH it.
+      eq(schema.schedules.isActive, true),
+      eq(schema.medications.status, 'active'),
+    ];
+
+    if (opts?.from) {
+      const bounds = opts.tz ? this.dayBoundsInTz(opts.from, opts.tz) : null;
+      let start: Date;
+      if (bounds) {
+        start = bounds.startOfDay;
+      } else {
+        start = new Date(opts.from);
+        if (Number.isNaN(start.getTime())) {
+          throw new BadRequestException('`from` must be a valid date');
+        }
+        start.setHours(0, 0, 0, 0);
+      }
+      conditions.push(gte(schema.doseEvents.scheduledFor, start));
+
+      if (opts.days != null) {
+        const end = new Date(start);
+        end.setDate(end.getDate() + opts.days);
+        conditions.push(lte(schema.doseEvents.scheduledFor, end));
+      }
+    }
+
+    const query = this.db
       .select({
         event: schema.doseEvents,
         schedule: schema.schedules,
@@ -76,13 +115,10 @@ export class DoseEventService {
         schema.medications,
         eq(schema.dosageForms.medicationId, schema.medications.id),
       )
-      .where(
-        and(
-          eq(schema.medications.userId, userId),
-          eq(schema.doseEvents.status, 'pending'),
-        ),
-      )
+      .where(and(...conditions))
       .orderBy(schema.doseEvents.scheduledFor);
+
+    const results = await (opts?.limit ? query.limit(opts.limit) : query);
 
     return results.map((r) => ({
       ...r.event,
