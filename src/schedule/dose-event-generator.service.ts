@@ -141,6 +141,25 @@ export class DoseEventGeneratorService {
     now: Date = new Date(),
     opts: { includeSnoozed?: boolean } = {},
   ): Promise<void> {
+    return this.clearPending(scheduleIds, dbc, { ...opts, after: now });
+  }
+
+  /**
+   * Delete still-pending events for the given schedules, optionally only those
+   * `after` a cutoff. Without a cutoff this also drops *earlier* pending doses:
+   * used when a medication is stopped, where a dose from earlier today was never
+   * resolved and never will be. Leaving those behind is what kept a stopped
+   * medication on the home screen — the hourly missed-marking cron doesn't
+   * filter on medication status, so they flip to "missed" and keep counting
+   * against the day's ring and the adherence stats.
+   *
+   * Taken/missed history is never touched.
+   */
+  async clearPending(
+    scheduleIds: string[],
+    dbc: DrizzleExecutor = this.db,
+    opts: { includeSnoozed?: boolean; after?: Date } = {},
+  ): Promise<void> {
     if (scheduleIds.length === 0) return;
     await dbc
       .delete(schema.doseEvents)
@@ -148,7 +167,9 @@ export class DoseEventGeneratorService {
         and(
           inArray(schema.doseEvents.scheduleId, scheduleIds),
           eq(schema.doseEvents.status, 'pending'),
-          gt(schema.doseEvents.scheduledFor, now),
+          ...(opts.after
+            ? [gt(schema.doseEvents.scheduledFor, opts.after)]
+            : []),
           ...(opts.includeSnoozed
             ? []
             : [eq(schema.doseEvents.snoozeCount, 0)]),

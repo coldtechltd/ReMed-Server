@@ -21,6 +21,21 @@ export class DoseEventService {
     private readonly scheduleService: ScheduleService,
   ) {}
 
+  /**
+   * Excludes doses scheduled *after* a medication was stopped.
+   *
+   * `complete()` deletes them, but rows stopped by an older build (or already
+   * flipped to "missed" by the hourly cron, which doesn't filter on medication
+   * status) are still in the table. Without this, a medication the user marked
+   * completed keeps showing up in the day's dose list and keeps its misses in
+   * the adherence numbers. `coalesce` keeps legacy rows with a null
+   * `completedAt` visible rather than hiding their whole history.
+   */
+  private readonly notStoppedBefore = sql`(
+    ${schema.medications.status} <> 'completed'
+    OR ${schema.doseEvents.scheduledFor} <= coalesce(${schema.medications.completedAt}, ${schema.doseEvents.scheduledFor})
+  )`;
+
   async findAllByUser(userId: string) {
     // This requires joining doseEvents -> schedules -> dosageForms -> medications
     // Drizzle query API doesn't support deep nested mapping easily without custom manual mapping,
@@ -169,6 +184,7 @@ export class DoseEventService {
           eq(schema.medications.userId, userId),
           gte(schema.doseEvents.scheduledFor, startOfDay),
           lte(schema.doseEvents.scheduledFor, endOfDay),
+          this.notStoppedBefore,
         ),
       )
       .orderBy(schema.doseEvents.scheduledFor);
@@ -236,6 +252,7 @@ export class DoseEventService {
           eq(schema.medications.userId, userId),
           gte(schema.doseEvents.scheduledFor, from),
           lte(schema.doseEvents.scheduledFor, to),
+          this.notStoppedBefore,
         ),
       );
 

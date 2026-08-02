@@ -287,14 +287,20 @@ export class MedicationService {
         )
         .returning();
 
-      // Drop upcoming doses so nothing fires. Taken/missed history survives, so
-      // adherence stats stay intact. Snoozed doses go too — the treatment is
-      // over, so a deferred dose is no longer owed and would otherwise sit in
-      // the user's upcoming list forever.
-      await this.doseEventGenerator.clearFuturePending(
+      // Drop every unresolved dose so nothing fires. Taken/missed history
+      // survives, so adherence stats stay intact. Snoozed doses go too — the
+      // treatment is over, so a deferred dose is no longer owed and would
+      // otherwise sit in the user's upcoming list forever.
+      //
+      // Note this clears *past* pending doses as well, not just future ones:
+      // a dose from earlier today that the user never resolved won't be
+      // resolved now that they've stopped, and the hourly missed-marking cron
+      // doesn't filter on medication status — it would flip those to "missed"
+      // and leave a stopped medication counting against the day's progress
+      // ring and the 30-day adherence rate.
+      await this.doseEventGenerator.clearPending(
         scheduleRows.map((row) => row.schedule.id),
         tx,
-        new Date(),
         { includeSnoozed: true },
       );
 
