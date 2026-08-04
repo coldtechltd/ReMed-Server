@@ -10,12 +10,22 @@ import { nodeProfilingIntegration } from '@sentry/profiling-node';
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
 
-  // Initialize Sentry
+  // Initialize Sentry. Sampling is deliberately low in production: the
+  // reminder cron alone opens a transaction every 60s, so tracing everything
+  // burns the quota on background noise rather than on real user traffic.
+  // Override with SENTRY_TRACES_SAMPLE_RATE when actively debugging.
+  const isProduction = process.env.NODE_ENV === 'production';
+  const sampleRate = process.env.SENTRY_TRACES_SAMPLE_RATE
+    ? Number(process.env.SENTRY_TRACES_SAMPLE_RATE)
+    : isProduction
+      ? 0.1
+      : 1.0;
+
   Sentry.init({
     dsn: process.env.SENTRY_DSN,
     integrations: [nodeProfilingIntegration()],
-    tracesSampleRate: 1.0,
-    profilesSampleRate: 1.0,
+    tracesSampleRate: sampleRate,
+    profilesSampleRate: sampleRate,
   });
 
   const app = await NestFactory.create(AppModule);
@@ -46,22 +56,30 @@ async function bootstrap() {
     credentials: true,
   });
 
-  const config = new DocumentBuilder()
-    .setTitle('Med App Server')
-    .setDescription('The Med App API description')
-    .setVersion('1.0')
-    .addTag('med-app')
-    .addBearerAuth()
-    .build();
-  const documentFactory = () => SwaggerModule.createDocument(app, config);
-  SwaggerModule.setup('docs', app, documentFactory);
+  // Swagger documents every route and DTO shape; keep it off the public
+  // internet. Set ENABLE_SWAGGER=true to expose it on a deployed environment.
+  const enableSwagger = !isProduction || process.env.ENABLE_SWAGGER === 'true';
+
+  if (enableSwagger) {
+    const config = new DocumentBuilder()
+      .setTitle('Med App Server')
+      .setDescription('The Med App API description')
+      .setVersion('1.0')
+      .addTag('med-app')
+      .addBearerAuth()
+      .build();
+    const documentFactory = () => SwaggerModule.createDocument(app, config);
+    SwaggerModule.setup('docs', app, documentFactory);
+  }
 
   const port = process.env.PORT ?? 3002;
   await app.listen(port);
   logger.log(`Server started on http://localhost:${port}`);
-  logger.log(
-    `Swagger documentation available on http://localhost:${port}/docs`,
-  );
+  if (enableSwagger) {
+    logger.log(
+      `Swagger documentation available on http://localhost:${port}/docs`,
+    );
+  }
 }
 
 bootstrap();

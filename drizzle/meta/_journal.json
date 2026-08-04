@@ -50,6 +50,20 @@
       "when": 1785012572068,
       "tag": "0006_conscious_roland_deschain",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1785721602501,
+      "tag": "0007_add_ai_tips_cache_and_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1785722651149,
+      "tag": "0008_add_entitlements_and_ai_usage",
+      "breakpoints": true
     }
   ]
 }

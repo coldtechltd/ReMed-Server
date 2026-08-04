@@ -13,6 +13,8 @@ import { DoseEventModule } from './dose-event/dose-event.module';
 import { ScheduleModule } from '@nestjs/schedule';
 import { NotificationsModule } from './notifications/notifications.module';
 import { AiModule } from './ai/ai.module';
+import { LegalModule } from './legal/legal.module';
+import { BillingModule } from './billing/billing.module';
 
 import { APP_INTERCEPTOR } from '@nestjs/core';
 import { AuditInterceptor } from './common/interceptors/audit.interceptor';
@@ -36,6 +38,8 @@ import { AuditInterceptor } from './common/interceptors/audit.interceptor';
     DoseEventModule,
     NotificationsModule,
     AiModule,
+    LegalModule,
+    BillingModule,
   ],
   providers: [
     {

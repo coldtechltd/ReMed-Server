@@ -1,10 +1,18 @@
 import { Injectable, Inject } from '@nestjs/common';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { eq, and, inArray } from 'drizzle-orm';
+import { eq, and, inArray, asc } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
 import { localDateParts } from '../schedule/schedule.util';
 import { projectStock } from '../dosage-form/stock.util';
+
+/**
+ * Ceiling on doses read per form for the stock projection. A very large tracked
+ * quantity would otherwise ask for more events than the 90-day horizon holds.
+ * Hitting the cap only softens the wording to "sufficient through at least …",
+ * which stays truthful.
+ */
+const MAX_STOCK_PROJECTION_EVENTS = 400;
 
 function formatDate(date: Date, timezone: string): string {
   const { year, month0, day } = localDateParts(date, timezone);
@@ -80,22 +88,6 @@ export class MedicationContextService {
         ),
       );
 
-    const scheduleIds = schedules.map((s) => s.id);
-    const pendingEvents = scheduleIds.length
-      ? await this.db
-          .select()
-          .from(schema.doseEvents)
-          .where(
-            and(
-              inArray(schema.doseEvents.scheduleId, scheduleIds),
-              eq(schema.doseEvents.status, 'pending'),
-            ),
-          )
-      : [];
-    pendingEvents.sort(
-      (a, b) => a.scheduledFor.getTime() - b.scheduledFor.getTime(),
-    );
-
     const medicationById = new Map(medications.map((m) => [m.id, m]));
     const schedulesByForm = new Map<string, (typeof schedules)[number][]>();
     for (const s of schedules) {
@@ -103,17 +95,11 @@ export class MedicationContextService {
       list.push(s);
       schedulesByForm.set(s.dosageFormId, list);
     }
-    const eventsByForm = new Map<string, typeof pendingEvents>();
-    const scheduleToForm = new Map(
-      schedules.map((s) => [s.id, s.dosageFormId]),
+
+    const eventsByForm = await this.loadStockProjectionEvents(
+      dosageForms,
+      schedulesByForm,
     );
-    for (const ev of pendingEvents) {
-      const formId = scheduleToForm.get(ev.scheduleId);
-      if (!formId) continue;
-      const list = eventsByForm.get(formId) ?? [];
-      list.push(ev);
-      eventsByForm.set(formId, list);
-    }
 
     const lines: string[] = [];
     for (const form of dosageForms) {
@@ -163,5 +149,59 @@ export class MedicationContextService {
     }
 
     return `User's current medications (as of ${formatDate(now, timezone)}):\n${lines.join('\n')}`;
+  }
+
+  /**
+   * Upcoming pending doses per dosage form, fetched only for forms that
+   * actually track stock and only as far as `projectStock` can possibly read.
+   *
+   * `projectStock` walks doses in order until the supply goes negative, so it
+   * never looks past `ceil(quantityOnHand / dosageAmount) + 1` events for a
+   * given form. Fetching every pending event for a 90-day horizon — as this
+   * did before — pulled hundreds of rows per chat turn to answer a question
+   * decided by the first handful.
+   */
+  private async loadStockProjectionEvents(
+    dosageForms: (typeof schema.dosageForms.$inferSelect)[],
+    schedulesByForm: Map<string, (typeof schema.schedules.$inferSelect)[]>,
+  ): Promise<Map<string, { scheduledFor: Date }[]>> {
+    const tracked = dosageForms.filter(
+      (form) =>
+        form.quantityOnHand !== null &&
+        form.quantityOnHand !== undefined &&
+        (schedulesByForm.get(form.id)?.length ?? 0) > 0,
+    );
+
+    const eventsByForm = new Map<string, { scheduledFor: Date }[]>();
+    if (tracked.length === 0) return eventsByForm;
+
+    await Promise.all(
+      tracked.map(async (form) => {
+        const scheduleIds = schedulesByForm.get(form.id)!.map((s) => s.id);
+        // +1 so the dose that tips the balance negative is included; that
+        // event is what `runsOutAt` reports.
+        const perDose = form.dosageAmount > 0 ? form.dosageAmount : 1;
+        const needed = Math.min(
+          Math.ceil(form.quantityOnHand! / perDose) + 1,
+          MAX_STOCK_PROJECTION_EVENTS,
+        );
+
+        const rows = await this.db
+          .select({ scheduledFor: schema.doseEvents.scheduledFor })
+          .from(schema.doseEvents)
+          .where(
+            and(
+              inArray(schema.doseEvents.scheduleId, scheduleIds),
+              eq(schema.doseEvents.status, 'pending'),
+            ),
+          )
+          .orderBy(asc(schema.doseEvents.scheduledFor))
+          .limit(needed);
+
+        eventsByForm.set(form.id, rows);
+      }),
+    );
+
+    return eventsByForm;
   }
 }

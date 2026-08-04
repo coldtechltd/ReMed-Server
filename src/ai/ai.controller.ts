@@ -4,6 +4,7 @@ import { Throttle } from '@nestjs/throttler';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { AiService, PendingMedicationAction } from './ai.service';
 import { ChatDto } from './dto/chat.dto';
+import { TipsDto } from './dto/tips.dto';
 
 // Groq calls cost money — cap usage at 20 requests / minute per IP.
 @Throttle({ default: { limit: 20, ttl: 60000 } })
@@ -15,9 +16,14 @@ export class AiController {
   constructor(private readonly aiService: AiService) {}
 
   @Post('tips')
-  @ApiOperation({ summary: 'Get personalised wellness tips' })
-  async getTips(@Request() req): Promise<{ tips: string[] }> {
-    const tips = await this.aiService.getTips(req.user.id);
+  @ApiOperation({
+    summary: 'Get personalised wellness tips (cached 24h unless force is set)',
+  })
+  async getTips(
+    @Request() req,
+    @Body() dto: TipsDto,
+  ): Promise<{ tips: string[] }> {
+    const tips = await this.aiService.getTips(req.user.id, dto?.force ?? false);
     return { tips };
   }
 

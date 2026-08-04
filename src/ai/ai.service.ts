@@ -1,5 +1,9 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Inject } from '@nestjs/common';
 import Groq from 'groq-sdk';
+import { NodePgDatabase } from 'drizzle-orm/node-postgres';
+import { eq } from 'drizzle-orm';
+import * as schema from '../db/schema';
+import { DRIZZLE_CLIENT } from '../db/drizzle.module';
 import { ProfileService } from '../profile/profile.service';
 import { MedicationService } from '../medication/medication.service';
 import { MedicationContextService } from './medication-context.service';
@@ -9,6 +13,24 @@ import {
 } from '../schedule/schedule.util';
 import { CreateFullMedicationDto } from '../medication/dto/create-full-medication.dto';
 import { CreateMedicationArgsDto } from './dto/chat.dto';
+import { EntitlementService } from '../billing/entitlement.service';
+
+export interface TokenUsage {
+  input: number;
+  output: number;
+}
+
+/**
+ * Pulls the provider's token counts off a completion. These were previously
+ * discarded; they're what makes per-user model spend attributable in
+ * `ai_usage`, so a runaway account is visible before the invoice is.
+ */
+function readUsage(completion: { usage?: Groq.CompletionUsage }): TokenUsage {
+  return {
+    input: completion.usage?.prompt_tokens ?? 0,
+    output: completion.usage?.completion_tokens ?? 0,
+  };
+}
 
 const SYSTEM_PROMPT = `You are a friendly wellness companion inside a medication reminder app.
 
@@ -42,6 +64,9 @@ ADDING A MEDICATION REMINDER:
 - If the user asks to change something before confirming, call propose_medication again with the corrected details.`;
 
 const MODEL = 'llama-3.3-70b-versatile';
+
+/** How long generated wellness tips stay fresh before the next tab visit regenerates them. */
+const TIPS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 export interface ChatMessage {
   role: 'user' | 'assistant';
@@ -165,11 +190,74 @@ const MEDICATION_TOOLS: Groq.Chat.ChatCompletionTool[] = [
     function: {
       name: 'create_medication',
       description:
-        'Actually create the previously proposed medication reminder. Only call this on a turn where the user has explicitly confirmed (e.g. "yes", "go ahead", "confirm") a proposal you made in your immediately preceding message. Never call this on the first mention of a medication.',
-      parameters: MEDICATION_TOOL_PARAMETERS,
+        'Actually create the previously proposed medication reminder. Only call this on a turn where the user has explicitly confirmed (e.g. "yes", "go ahead", "confirm") a proposal you made in your immediately preceding message. Never call this on the first mention of a medication. Takes no details — the app already has the exact proposal the user confirmed.',
+      // Deliberately NOT the full MEDICATION_TOOL_PARAMETERS. `chat()` executes
+      // this against the stored `priorPendingAction.args`, never the model's
+      // re-emitted arguments, so restating ~17 fields here bought nothing and
+      // doubled the tool-schema tokens sent on every single turn.
+      parameters: {
+        type: 'object',
+        properties: {
+          confirmed: {
+            type: 'boolean',
+            description:
+              'Set true to confirm the user explicitly agreed to the proposal in your previous message.',
+          },
+        },
+        required: ['confirmed'],
+      },
     },
   },
 ];
+
+/**
+ * Whether this turn could plausibly involve setting up a medication reminder.
+ * The tool schemas are ~1k input tokens sent on every request, so they're
+ * attached only when they might actually be used.
+ *
+ * Deliberately generous — a false negative means the model can't record a
+ * medication the user asked for, which is far worse than a few wasted tokens.
+ * A bare confirmation ("yes", "go ahead") carries no keywords of its own, so
+ * an in-flight proposal and recent intent anywhere in the window both count.
+ */
+const MEDICATION_INTENT = new RegExp(
+  [
+    'add',
+    'creat',
+    'set ?up',
+    'start(ing)? (taking|on)',
+    'new (med|drug|pill|prescription)',
+    'remind',
+    'reminder',
+    'track',
+    'schedul',
+    'dose',
+    'dosage',
+    'tablet',
+    'capsule',
+    'injection',
+    'inhaler',
+    'twice',
+    'daily',
+    'every \\d',
+    'mg\\b',
+    'ml\\b',
+  ].join('|'),
+  'i',
+);
+
+function needsMedicationTools(
+  message: string,
+  history: ChatMessage[],
+  hasPendingProposal: boolean,
+): boolean {
+  if (hasPendingProposal) return true;
+  if (MEDICATION_INTENT.test(message)) return true;
+  // Detail-gathering runs over several short turns ("what dose?" / "500mg"),
+  // so keep the tools attached for the rest of a conversation that started
+  // down that path.
+  return history.slice(-6).some((m) => MEDICATION_INTENT.test(m.content));
+}
 
 interface ToolResult {
   status: 'ok' | 'error';
@@ -203,11 +291,67 @@ export class AiService {
     private readonly profileService: ProfileService,
     private readonly medicationService: MedicationService,
     private readonly medicationContextService: MedicationContextService,
+    private readonly entitlements: EntitlementService,
+    @Inject(DRIZZLE_CLIENT)
+    private readonly db: NodePgDatabase<typeof schema>,
   ) {
     this.groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
   }
 
-  async getTips(userId: string): Promise<string[]> {
+  /**
+   * Cached for a day per user. `force` bypasses the cache for the tab's
+   * explicit refresh button, so a deliberate tap still gets fresh tips while
+   * ordinary navigation back to the tab does not.
+   */
+  async getTips(userId: string, force = false): Promise<string[]> {
+    if (!force) {
+      const cached = await this.readCachedTips(userId);
+      // Serving from cache costs nothing, so it must not spend the user's
+      // daily allowance — otherwise merely opening the tab would.
+      if (cached) return cached;
+    }
+
+    // Checked before the request, recorded after: a generation that fails
+    // shouldn't burn an allowance the user never got value from.
+    await this.entitlements.assertQuota(userId, 'tips');
+
+    const { tips, usage } = await this.generateTips(userId);
+    await this.entitlements.recordUsage(userId, 'tips', usage);
+    await this.writeCachedTips(userId, tips);
+    return tips;
+  }
+
+  private async readCachedTips(userId: string): Promise<string[] | null> {
+    const [row] = await this.db
+      .select()
+      .from(schema.aiTipsCache)
+      .where(eq(schema.aiTipsCache.userId, userId))
+      .limit(1);
+
+    if (!row) return null;
+    if (Date.now() - row.generatedAt.getTime() >= TIPS_CACHE_TTL_MS)
+      return null;
+    return Array.isArray(row.tips) && row.tips.length ? row.tips : null;
+  }
+
+  private async writeCachedTips(userId: string, tips: string[]): Promise<void> {
+    if (!tips.length) return;
+    try {
+      await this.db
+        .insert(schema.aiTipsCache)
+        .values({ userId, tips, generatedAt: new Date() })
+        .onConflictDoUpdate({
+          target: schema.aiTipsCache.userId,
+          set: { tips, generatedAt: new Date() },
+        });
+    } catch {
+      // A cache write failing shouldn't cost the user their tips.
+    }
+  }
+
+  private async generateTips(
+    userId: string,
+  ): Promise<{ tips: string[]; usage: TokenUsage }> {
     let profileContext = '';
     try {
       const profile = await this.profileService.getProfile(userId);
@@ -234,12 +378,16 @@ export class AiService {
       max_tokens: 300,
     });
 
+    const usage = readUsage(completion);
     const raw = completion.choices[0]?.message?.content ?? '[]';
     try {
       const match = raw.match(/\[[\s\S]*\]/);
-      return match ? JSON.parse(match[0]) : [raw];
+      const tips = match
+        ? (JSON.parse(match[0]) as string[])
+        : ([raw] as string[]);
+      return { tips, usage };
     } catch {
-      return [raw];
+      return { tips: [raw], usage };
     }
   }
 
@@ -248,6 +396,27 @@ export class AiService {
     message: string,
     history: ChatMessage[] = [],
     timezone = 'UTC',
+  ): Promise<{ reply: string; pendingAction?: PendingMedicationAction }> {
+    // Before any work: the context build below runs four DB queries, so a
+    // caller who is out of allowance should be turned away ahead of them.
+    await this.entitlements.assertQuota(userId, 'chat');
+    const usage: TokenUsage = { input: 0, output: 0 };
+
+    try {
+      return await this.runChat(userId, message, history, timezone, usage);
+    } finally {
+      // In `finally` so every exit path is metered — including the ones that
+      // bail out after a provider error, which still cost us input tokens.
+      await this.entitlements.recordUsage(userId, 'chat', usage);
+    }
+  }
+
+  private async runChat(
+    userId: string,
+    message: string,
+    history: ChatMessage[],
+    timezone: string,
+    usage: TokenUsage,
   ): Promise<{ reply: string; pendingAction?: PendingMedicationAction }> {
     // Build context prefix from profile (once, as system injection)
     let profileContext = '';
@@ -299,16 +468,29 @@ export class AiService {
     let choice: Groq.Chat.ChatCompletionMessage | undefined;
     let toolCall: Groq.Chat.ChatCompletionMessageToolCall | undefined;
 
+    const withTools = needsMedicationTools(
+      message,
+      history,
+      Boolean(priorPendingAction),
+    );
+
     try {
       const completion = await this.groq.chat.completions.create({
         model: MODEL,
         messages,
-        tools: MEDICATION_TOOLS,
-        tool_choice: 'auto',
-        parallel_tool_calls: false,
+        ...(withTools
+          ? {
+              tools: MEDICATION_TOOLS,
+              tool_choice: 'auto' as const,
+              parallel_tool_calls: false,
+            }
+          : {}),
         temperature: 0.6,
         max_tokens: 300,
       });
+      const { input, output } = readUsage(completion);
+      usage.input += input;
+      usage.output += output;
       choice = completion.choices[0]?.message;
       toolCall = choice?.tool_calls?.[0];
     } catch (err) {
@@ -446,6 +628,9 @@ export class AiService {
         temperature: 0.6,
         max_tokens: 250,
       });
+      const { input, output } = readUsage(followUp);
+      usage.input += input;
+      usage.output += output;
       followUpContent = followUp.choices[0]?.message?.content ?? null;
     } catch {
       // The medication was already proposed/created above — losing the

@@ -7,4 +7,7 @@ export * from './medication';
 export * from './dosageForm';
 export * from './schedule';
 export * from './doseEvent';
+export * from './ai-tips-cache';
+export * from './entitlement';
+export * from './ai-usage';
 export * from './relations';
