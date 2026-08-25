@@ -9,6 +9,7 @@ import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { eq, lte, gte, and, desc, sql } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { UpdateDoseEventDto } from './dto/update-dose-event.dto';
+import { LogDoseDto } from './dto/log-dose.dto';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
 import { ScheduleService } from '../schedule/schedule.service';
 import { zonedTimeToUtc } from '../schedule/schedule.util';
@@ -399,6 +400,94 @@ export class DoseEventService {
       schedule: r.schedule,
       dosageForm: r.dosageForm,
       medication: r.medication,
+    };
+  }
+
+  /**
+   * Log an ad-hoc dose that was actually taken — the write path for
+   * as-needed (PRN) medications, whose schedules never materialize dose
+   * events. Also works for scheduled forms (an extra dose outside the plan):
+   * the event is a record, not a reminder, so it's created already-taken with
+   * `reminderSent` set so no cron ever picks it up.
+   */
+  async logDose(userId: string, dto: LogDoseDto) {
+    const takenAt = dto.takenAt ? new Date(dto.takenAt) : new Date();
+    // Small clock-skew allowance; anything further ahead is a typo, and a
+    // future "taken" would confuse the day ring and stats.
+    if (takenAt.getTime() > Date.now() + 5 * 60_000) {
+      throw new BadRequestException('takenAt cannot be in the future');
+    }
+
+    const [form] = await this.db
+      .select({
+        dosageForm: schema.dosageForms,
+        medication: schema.medications,
+      })
+      .from(schema.dosageForms)
+      .innerJoin(
+        schema.medications,
+        eq(schema.dosageForms.medicationId, schema.medications.id),
+      )
+      .where(
+        and(
+          eq(schema.dosageForms.id, dto.dosageFormId),
+          eq(schema.medications.userId, userId),
+        ),
+      );
+
+    if (!form) {
+      throw new NotFoundException(
+        `Dosage form with ID ${dto.dosageFormId} not found`,
+      );
+    }
+    if (form.medication.status === 'completed') {
+      throw new BadRequestException(
+        'This medication has been stopped — restart it to log doses',
+      );
+    }
+
+    // Attach the event to the form's as-needed schedule when one exists, so
+    // PRN logs stay distinguishable from scheduled doses; fall back to any
+    // schedule for "extra dose" logs on scheduled forms.
+    const formSchedules = await this.db
+      .select()
+      .from(schema.schedules)
+      .where(eq(schema.schedules.dosageFormId, dto.dosageFormId));
+    const schedule =
+      formSchedules.find((s) => s.type === 'as_needed' || s.asNeeded) ??
+      formSchedules[0];
+    if (!schedule) {
+      throw new BadRequestException(
+        'This dosage form has no schedule to log against',
+      );
+    }
+
+    const [event] = await this.db
+      .insert(schema.doseEvents)
+      .values({
+        scheduleId: schedule.id,
+        scheduledFor: takenAt,
+        takenAt,
+        status: 'taken',
+        reminderSent: true,
+      })
+      .returning();
+
+    // Same stock rule as update(): only forms that track stock, floored at 0.
+    if (form.dosageForm.quantityOnHand !== null) {
+      await this.db
+        .update(schema.dosageForms)
+        .set({
+          quantityOnHand: sql`GREATEST(${schema.dosageForms.quantityOnHand} - ${form.dosageForm.dosageAmount}, 0)`,
+        })
+        .where(eq(schema.dosageForms.id, form.dosageForm.id));
+    }
+
+    return {
+      ...event,
+      schedule,
+      dosageForm: form.dosageForm,
+      medication: form.medication,
     };
   }
 

@@ -1,5 +1,6 @@
 import {
   IsString,
+  IsIn,
   IsOptional,
   IsBoolean,
   IsInt,
@@ -9,9 +10,13 @@ import {
 import { ApiPropertyOptional } from '@nestjs/swagger';
 
 export class UpdateDoseEventDto {
-  @ApiPropertyOptional({ description: 'Status: taken or missed' })
+  @ApiPropertyOptional({
+    description: 'Status: taken or missed',
+    enum: ['taken', 'missed'],
+  })
   @IsOptional()
   @IsString()
+  @IsIn(['taken', 'missed'])
   status?: string;
 
   @ApiPropertyOptional({ description: 'Was reminder sent?' })

@@ -15,6 +15,7 @@ import { AuthService } from './auth.service';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
+import { RefreshTokenDto } from './dto/refresh-token.dto';
 
 // Clients that don't send an X-Device-Id (e.g. the OAuth browser redirect)
 // all share this single session slot rather than crashing the request.
@@ -53,6 +54,16 @@ export class AuthController {
     @Headers('x-device-id') deviceId?: string,
   ) {
     return this.auth.register(registerDto, deviceId || FALLBACK_DEVICE_ID);
+  }
+
+  // ---------------- REFRESH ------------------
+  // Public by design: the caller's access token is typically already expired
+  // when this is hit. The refresh token itself is the credential (verified
+  // signature + `type: 'refresh'` claim + live device session).
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
+  @Post('refresh')
+  async refresh(@Body() dto: RefreshTokenDto) {
+    return this.auth.refreshTokens(dto.refreshToken);
   }
 
   // ---------------- GOOGLE AUTH ------------------

@@ -2,6 +2,7 @@ import {
   Controller,
   Get,
   Body,
+  Post,
   Patch,
   Param,
   Query,
@@ -11,6 +12,7 @@ import {
 } from '@nestjs/common';
 import { DoseEventService } from './dose-event.service';
 import { UpdateDoseEventDto } from './dto/update-dose-event.dto';
+import { LogDoseDto } from './dto/log-dose.dto';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 
@@ -71,6 +73,15 @@ export class DoseEventController {
     @Query('to') to?: string,
   ) {
     return this.doseEventService.getStats(req.user.id, from, to);
+  }
+
+  @Post('log')
+  @ApiOperation({
+    summary:
+      'Log an ad-hoc taken dose (the write path for as-needed medications)',
+  })
+  logDose(@Request() req, @Body() dto: LogDoseDto) {
+    return this.doseEventService.logDose(req.user.id, dto);
   }
 
   @Get(':id')

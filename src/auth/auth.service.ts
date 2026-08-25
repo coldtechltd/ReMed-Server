@@ -163,8 +163,61 @@ export class AuthService {
     };
 
     const accessToken = this.jwt.sign(payload, { expiresIn: '7d' });
-    const refreshToken = this.jwt.sign(payload, { expiresIn: '30d' });
+    // The `type` claim is what stops an access token from being replayed
+    // against /auth/refresh — both tokens are signed with the same secret,
+    // so expiry alone can't tell them apart.
+    const refreshToken = this.jwt.sign(
+      { ...payload, type: 'refresh' },
+      { expiresIn: '30d' },
+    );
 
     return { accessToken, refreshToken, hasProfile };
+  }
+
+  // Exchange a valid refresh token for a fresh token pair (rotating the
+  // refresh token too, so an active user never hits the 30-day cliff).
+  // Revocation still works through the device session's tokenVersion: logout
+  // bumps it, which invalidates outstanding refresh tokens as well.
+  async refreshTokens(refreshToken: string) {
+    let payload: any;
+    try {
+      payload = this.jwt.verify(refreshToken);
+    } catch {
+      throw new UnauthorizedException('Invalid refresh token');
+    }
+
+    if (payload.type !== 'refresh') {
+      throw new UnauthorizedException('Invalid refresh token');
+    }
+
+    const [user] = await this.db
+      .select()
+      .from(users)
+      .where(eq(users.id, payload.sub));
+    if (!user) throw new UnauthorizedException('User no longer exists');
+
+    const [session] = await this.db
+      .select()
+      .from(deviceSessions)
+      .where(
+        and(
+          eq(deviceSessions.userId, payload.sub),
+          eq(deviceSessions.deviceId, payload.deviceId),
+        ),
+      );
+    if (
+      !session ||
+      (session.tokenVersion ?? 0) !== (payload.tokenVersion ?? 0)
+    ) {
+      throw new UnauthorizedException('Token has been revoked');
+    }
+
+    await this.db
+      .update(deviceSessions)
+      .set({ lastSeenAt: new Date() })
+      .where(eq(deviceSessions.id, session.id));
+
+    const hasProfile = await this.hasUserProfile(user.id);
+    return this.generateTokens(user, hasProfile, session);
   }
 }
