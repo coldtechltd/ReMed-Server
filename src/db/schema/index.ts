@@ -10,4 +10,8 @@ export * from './doseEvent';
 export * from './ai-tips-cache';
 export * from './entitlement';
 export * from './ai-usage';
+export * from './password-reset-token';
+export * from './cron-lock';
+export * from './audit-log';
+export * from './consent-record';
 export * from './relations';

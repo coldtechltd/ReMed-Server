@@ -7,11 +7,12 @@ import {
 } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { eq, and, lte } from 'drizzle-orm';
+import { eq, and, lte, inArray } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { CreateScheduleDto } from './dto/create-schedule.dto';
 import { UpdateScheduleDto } from './dto/update-schedule.dto';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
+import { CronLockService } from '../common/cron-lock/cron-lock.service';
 import { DosageFormService } from '../dosage-form/dosage-form.service';
 import {
   DoseEventGeneratorService,
@@ -28,6 +29,7 @@ export class ScheduleService {
     private readonly db: NodePgDatabase<typeof schema>,
     private readonly dosageFormService: DosageFormService,
     private readonly doseEventGenerator: DoseEventGeneratorService,
+    private readonly cronLock: CronLockService,
   ) {}
 
   /** startDate/endDate/status of the medication owning a dosage form. */
@@ -198,8 +200,10 @@ export class ScheduleService {
 
   @Cron(CronExpression.EVERY_DAY_AT_MIDNIGHT)
   async handleDailyDoseEventGeneration() {
-    this.logger.log('Running daily dose event generation...');
     try {
+      if (!(await this.cronLock.claim('dose-horizon-topup', 86_400_000)))
+        return;
+      this.logger.log('Running daily dose event generation...');
       // Medication start/end dates bound the generated window, so join them in.
       const rows = await this.db
         .select({
@@ -247,11 +251,13 @@ export class ScheduleService {
 
   @Cron(CronExpression.EVERY_HOUR)
   async handleMissedDoseMarking() {
-    this.logger.log('Checking for missed doses...');
     // Grace window: 2 hours after scheduled time before marking missed
     const cutoff = new Date(Date.now() - 2 * 60 * 60 * 1000);
 
     try {
+      if (!(await this.cronLock.claim('missed-dose-marking', 3_600_000)))
+        return;
+      this.logger.log('Checking for missed doses...');
       const result = await this.db
         .update(schema.doseEvents)
         .set({ status: 'missed' })
@@ -259,6 +265,24 @@ export class ScheduleService {
           and(
             eq(schema.doseEvents.status, 'pending'),
             lte(schema.doseEvents.scheduledFor, cutoff),
+            // Only doses of active medications: leftovers from a stopped
+            // medication (cleared by newer builds, but rows from older ones
+            // remain) must not flip to "missed" and pollute adherence stats.
+            inArray(
+              schema.doseEvents.scheduleId,
+              this.db
+                .select({ id: schema.schedules.id })
+                .from(schema.schedules)
+                .innerJoin(
+                  schema.dosageForms,
+                  eq(schema.schedules.dosageFormId, schema.dosageForms.id),
+                )
+                .innerJoin(
+                  schema.medications,
+                  eq(schema.dosageForms.medicationId, schema.medications.id),
+                )
+                .where(eq(schema.medications.status, 'active')),
+            ),
           ),
         )
         .returning({ id: schema.doseEvents.id });

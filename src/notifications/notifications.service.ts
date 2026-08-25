@@ -15,6 +15,7 @@ import {
 import { Expo, ExpoPushMessage, ExpoPushTicket } from 'expo-server-sdk';
 import * as schema from '../db/schema';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
+import { CronLockService } from '../common/cron-lock/cron-lock.service';
 import {
   projectStock,
   daysUntil,
@@ -47,6 +48,7 @@ export class NotificationsService {
   constructor(
     @Inject(DRIZZLE_CLIENT)
     private readonly db: NodePgDatabase<typeof schema>,
+    private readonly cronLock: CronLockService,
   ) {
     this.expo = new Expo();
   }
@@ -61,6 +63,7 @@ export class NotificationsService {
     const staleCutoff = new Date(now.getTime() - 2 * 60 * 60 * 1000);
 
     try {
+      if (!(await this.cronLock.claim('dose-reminders', 60_000))) return;
       // Joined against deviceSessions (not users) so a user signed into
       // several devices gets the reminder on all of them, not just whichever
       // device last overwrote a single shared push token.
@@ -189,6 +192,8 @@ export class NotificationsService {
     this.logger.debug('Checking for medications that need a refill...');
 
     try {
+      if (!(await this.cronLock.claim('refill-reminders', 86_400_000)))
+        return;
       const now = new Date();
       const throttleCutoff = new Date(now.getTime() - 20 * 60 * 60 * 1000);
       const leadCutoff = new Date(
@@ -451,6 +456,9 @@ export class NotificationsService {
    * the only place that failure is visible, so it gets logged loudly, and a
    * token the platform has disowned is cleared so we stop pushing into a void.
    */
+  // Deliberately NOT behind the cron lock: the pending queue is in-memory and
+  // per-instance, so every replica must poll receipts for the tickets *it*
+  // sent. Running everywhere is correct here, not a double-fire.
   @Cron(CronExpression.EVERY_10_MINUTES)
   async handlePushReceipts() {
     if (this.pendingReceipts.length === 0) return;

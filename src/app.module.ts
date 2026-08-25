@@ -15,6 +15,8 @@ import { NotificationsModule } from './notifications/notifications.module';
 import { AiModule } from './ai/ai.module';
 import { LegalModule } from './legal/legal.module';
 import { BillingModule } from './billing/billing.module';
+import { CronLockModule } from './common/cron-lock/cron-lock.module';
+import { MailModule } from './common/mail/mail.module';
 
 import { APP_INTERCEPTOR } from '@nestjs/core';
 import { AuditInterceptor } from './common/interceptors/audit.interceptor';
@@ -29,6 +31,8 @@ import { AuditInterceptor } from './common/interceptors/audit.interceptor';
     // Stricter limits are applied per-route via @Throttle (auth, AI).
     ThrottlerModule.forRoot([{ ttl: 60000, limit: 100 }]),
     DrizzleModule,
+    CronLockModule,
+    MailModule,
     AuthModule,
     ProfileModule,
     CountryModule,

@@ -71,8 +71,9 @@ export class DoseEventController {
     @Request() req,
     @Query('from') from?: string,
     @Query('to') to?: string,
+    @Query('tz') tz?: string,
   ) {
-    return this.doseEventService.getStats(req.user.id, from, to);
+    return this.doseEventService.getStats(req.user.id, from, to, tz);
   }
 
   @Post('log')

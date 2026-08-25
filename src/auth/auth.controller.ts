@@ -1,6 +1,7 @@
 import {
   Controller,
   Post,
+  Delete,
   Request,
   UseGuards,
   Get,
@@ -16,6 +17,9 @@ import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
+import { ForgotPasswordDto } from './dto/forgot-password.dto';
+import { ResetPasswordDto } from './dto/reset-password.dto';
+import { AppleSignInDto, GoogleIdTokenDto } from './dto/oauth-token.dto';
 
 // Clients that don't send an X-Device-Id (e.g. the OAuth browser redirect)
 // all share this single session slot rather than crashing the request.
@@ -64,6 +68,58 @@ export class AuthController {
   @Post('refresh')
   async refresh(@Body() dto: RefreshTokenDto) {
     return this.auth.refreshTokens(dto.refreshToken);
+  }
+
+  // ---------------- PASSWORD RESET ------------------
+  // Tighter than login: each request sends an email, so this is also the
+  // spam-abuse surface. Always 200 — the response must not reveal whether
+  // the address has an account.
+  @Throttle({ default: { limit: 3, ttl: 60000 } })
+  @Post('forgot-password')
+  async forgotPassword(@Body() dto: ForgotPasswordDto) {
+    await this.auth.requestPasswordReset(dto.email);
+    return {
+      success: true,
+      message: 'If that email has an account, a reset code is on its way.',
+    };
+  }
+
+  @Throttle({ default: { limit: 5, ttl: 60000 } })
+  @Post('reset-password')
+  async resetPassword(@Body() dto: ResetPasswordDto) {
+    return this.auth.resetPassword(dto.email, dto.code, dto.newPassword);
+  }
+
+  // ---------------- NATIVE OAUTH (mobile) ------------------
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
+  @Post('google/mobile')
+  async googleMobile(
+    @Body() dto: GoogleIdTokenDto,
+    @Headers('x-device-id') deviceId?: string,
+  ) {
+    return this.auth.loginWithGoogleIdToken(
+      dto.idToken,
+      deviceId || FALLBACK_DEVICE_ID,
+    );
+  }
+
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
+  @Post('apple')
+  async apple(
+    @Body() dto: AppleSignInDto,
+    @Headers('x-device-id') deviceId?: string,
+  ) {
+    return this.auth.loginWithApple(
+      dto.identityToken,
+      deviceId || FALLBACK_DEVICE_ID,
+    );
+  }
+
+  // ---------------- ACCOUNT DELETION ------------------
+  @UseGuards(JwtAuthGuard)
+  @Delete('account')
+  async deleteAccount(@Request() req) {
+    return this.auth.deleteAccount(req.user.id);
   }
 
   // ---------------- GOOGLE AUTH ------------------

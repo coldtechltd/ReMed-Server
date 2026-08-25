@@ -12,7 +12,7 @@ import { UpdateDoseEventDto } from './dto/update-dose-event.dto';
 import { LogDoseDto } from './dto/log-dose.dto';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
 import { ScheduleService } from '../schedule/schedule.service';
-import { zonedTimeToUtc } from '../schedule/schedule.util';
+import { dayKeyInTz, zonedTimeToUtc } from '../schedule/schedule.util';
 
 @Injectable()
 export class DoseEventService {
@@ -220,14 +220,34 @@ export class DoseEventService {
     }
   }
 
-  async getStats(userId: string, fromStr?: string, toStr?: string) {
-    // Default window: last 30 days (inclusive of today).
-    const to = toStr ? new Date(toStr) : new Date();
-    to.setHours(23, 59, 59, 999);
-    const from = fromStr
-      ? new Date(fromStr)
-      : new Date(to.getTime() - 29 * 24 * 60 * 60 * 1000);
-    from.setHours(0, 0, 0, 0);
+  async getStats(
+    userId: string,
+    fromStr?: string,
+    toStr?: string,
+    tz?: string,
+  ) {
+    // Default window: last 30 days (inclusive of today). With a tz, both the
+    // window bounds and the per-day buckets below use the user's calendar
+    // days — server-local bucketing put doses near midnight on the wrong day
+    // for almost every user. Falls back to server-local on a bad/missing tz.
+    const toBounds = tz
+      ? this.dayBoundsInTz(toStr ?? dayKeyInTz(new Date(), tz), tz)
+      : null;
+    const to = toBounds ? toBounds.endOfDay : toStr ? new Date(toStr) : new Date();
+    if (!toBounds) to.setHours(23, 59, 59, 999);
+
+    const defaultFromInstant = new Date(
+      to.getTime() - 29 * 24 * 60 * 60 * 1000,
+    );
+    const fromBounds = tz
+      ? this.dayBoundsInTz(fromStr ?? dayKeyInTz(defaultFromInstant, tz), tz)
+      : null;
+    const from = fromBounds
+      ? fromBounds.startOfDay
+      : fromStr
+        ? new Date(fromStr)
+        : defaultFromInstant;
+    if (!fromBounds) from.setHours(0, 0, 0, 0);
 
     const rows = await this.db
       .select({
@@ -257,11 +277,8 @@ export class DoseEventService {
         ),
       );
 
-    // Local (server-time) YYYY-MM-DD bucket key for a date.
-    const dayKey = (d: Date) => {
-      const local = new Date(d.getTime() - d.getTimezoneOffset() * 60_000);
-      return local.toISOString().slice(0, 10);
-    };
+    // YYYY-MM-DD bucket key in the user's timezone (server-local fallback).
+    const dayKey = (d: Date) => dayKeyInTz(d, tz);
 
     let taken = 0;
     let missed = 0;

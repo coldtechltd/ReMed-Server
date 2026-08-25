@@ -18,6 +18,7 @@ import { UpdateMedicationDto } from './dto/update-medication.dto';
 import { CreateFullMedicationDto } from './dto/create-full-medication.dto';
 import { RestartMedicationDto } from './dto/restart-medication.dto';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
+import { CronLockService } from '../common/cron-lock/cron-lock.service';
 import { DoseEventGeneratorService } from '../schedule/dose-event-generator.service';
 import { endOfDayInTz } from '../schedule/schedule.util';
 
@@ -48,6 +49,7 @@ export class MedicationService {
     @Inject(DRIZZLE_CLIENT)
     private readonly db: NodePgDatabase<typeof schema>,
     private readonly doseEventGenerator: DoseEventGeneratorService,
+    private readonly cronLock: CronLockService,
   ) {}
 
   /**
@@ -385,8 +387,10 @@ export class MedicationService {
    */
   @Cron(CronExpression.EVERY_DAY_AT_1AM)
   async handleCourseCompletion() {
-    this.logger.log('Checking for treatment courses that have ended...');
     try {
+      if (!(await this.cronLock.claim('course-completion', 86_400_000)))
+        return;
+      this.logger.log('Checking for treatment courses that have ended...');
       const now = new Date();
 
       // Candidates: any active course already past its bare endDate. The

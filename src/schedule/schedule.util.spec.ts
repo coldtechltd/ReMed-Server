@@ -6,6 +6,7 @@ import {
   MAX_EVENTS_PER_GENERATION,
   DEFAULT_HORIZON_DAYS,
 } from './schedule.util';
+import { dayKeyInTz } from './schedule.util';
 import { DoseEventGeneratorService } from './dose-event-generator.service';
 
 const HOUR = 60 * 60 * 1000;
@@ -208,5 +209,27 @@ describe('DoseEventGeneratorService.generationWindow', () => {
   it('returns null when the course is already over', () => {
     const endDate = new Date('2026-07-01T00:00:00Z');
     expect(generator.generationWindow(schedule, { endDate }, now)).toBeNull();
+  });
+});
+
+describe('dayKeyInTz', () => {
+  // 2026-03-15T03:30Z: still March 14 in New York (UTC-4), already
+  // March 15 in Tokyo (UTC+9).
+  const instant = new Date('2026-03-15T03:30:00Z');
+
+  it('buckets an instant into the calendar day of the given zone', () => {
+    expect(dayKeyInTz(instant, 'America/New_York')).toBe('2026-03-14');
+    expect(dayKeyInTz(instant, 'Asia/Tokyo')).toBe('2026-03-15');
+    expect(dayKeyInTz(instant, 'UTC')).toBe('2026-03-15');
+  });
+
+  it('falls back to the server-local day for a bad or missing zone', () => {
+    const local = new Date(
+      instant.getTime() - instant.getTimezoneOffset() * 60_000,
+    )
+      .toISOString()
+      .slice(0, 10);
+    expect(dayKeyInTz(instant, 'Not/AZone')).toBe(local);
+    expect(dayKeyInTz(instant)).toBe(local);
   });
 });

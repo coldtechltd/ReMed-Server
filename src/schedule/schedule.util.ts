@@ -79,6 +79,28 @@ function weekdayAbbrev(date: Date, timeZone: string): string {
   }).format(date);
 }
 
+/**
+ * YYYY-MM-DD key of the calendar day containing `date`, as seen in `timeZone`.
+ * Falls back to the server's local day when the zone is missing or invalid —
+ * day bucketing should degrade, not 500.
+ */
+export function dayKeyInTz(date: Date, timeZone?: string): string {
+  if (timeZone) {
+    try {
+      const p = localDateParts(date, timeZone);
+      if (!Number.isNaN(p.year)) {
+        const mm = String(p.month0 + 1).padStart(2, '0');
+        const dd = String(p.day).padStart(2, '0');
+        return `${p.year}-${mm}-${dd}`;
+      }
+    } catch {
+      // invalid IANA timezone — fall through to server-local
+    }
+  }
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 10);
+}
+
 /** Last millisecond of the calendar day containing `date`, in `timeZone`. */
 export function endOfDayInTz(date: Date, timeZone: string): Date {
   const d = localDateParts(date, timeZone);

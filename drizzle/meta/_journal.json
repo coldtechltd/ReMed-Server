@@ -64,6 +64,13 @@
       "when": 1785722651149,
       "tag": "0008_add_entitlements_and_ai_usage",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1787672637681,
+      "tag": "0009_left_wrecker",
+      "breakpoints": true
     }
   ]
 }
