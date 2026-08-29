@@ -30,6 +30,14 @@ async function bootstrap() {
 
   const app = await NestFactory.create(AppModule);
 
+  // Behind the nginx reverse proxy every connection arrives from 127.0.0.1.
+  // Without this, `req.ip` is the loopback address on *every* request, which
+  // collapses the per-IP ThrottlerGuard into one shared 100 req/min bucket for
+  // the whole user base and records 127.0.0.1 as the client on every
+  // audit_logs row. 'loopback' honours X-Forwarded-For only when the peer is
+  // local, so a request that reaches the port directly cannot spoof its IP.
+  app.getHttpAdapter().getInstance().set('trust proxy', 'loopback');
+
   // Global Filter
   app.useGlobalFilters(new AllExceptionsFilter());
 
