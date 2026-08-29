@@ -6,6 +6,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
+import { SentryCron } from '@sentry/nestjs';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { eq, and, lte, inArray } from 'drizzle-orm';
 import * as schema from '../db/schema';
@@ -199,6 +200,12 @@ export class ScheduleService {
   }
 
   @Cron(CronExpression.EVERY_DAY_AT_MIDNIGHT)
+  @SentryCron('dose-horizon-topup', {
+    schedule: { type: 'crontab', value: '0 0 * * *' },
+    checkinMargin: 60,
+    maxRuntime: 30,
+    timezone: 'UTC',
+  })
   async handleDailyDoseEventGeneration() {
     try {
       if (!(await this.cronLock.claim('dose-horizon-topup', 86_400_000)))
@@ -250,6 +257,12 @@ export class ScheduleService {
   }
 
   @Cron(CronExpression.EVERY_HOUR)
+  @SentryCron('mark-missed-doses', {
+    schedule: { type: 'crontab', value: '0 * * * *' },
+    checkinMargin: 15,
+    maxRuntime: 15,
+    timezone: 'UTC',
+  })
   async handleMissedDoseMarking() {
     // Grace window: 2 hours after scheduled time before marking missed
     const cutoff = new Date(Date.now() - 2 * 60 * 60 * 1000);

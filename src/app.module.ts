@@ -11,6 +11,7 @@ import { MedicationModule } from './medication/medication.module';
 import { DosageFormModule } from './dosage-form/dosage-form.module';
 import { DoseEventModule } from './dose-event/dose-event.module';
 import { ScheduleModule } from '@nestjs/schedule';
+import { SentryModule } from '@sentry/nestjs/setup';
 import { NotificationsModule } from './notifications/notifications.module';
 import { AiModule } from './ai/ai.module';
 import { LegalModule } from './legal/legal.module';
@@ -23,6 +24,9 @@ import { AuditInterceptor } from './common/interceptors/audit.interceptor';
 
 @Module({
   imports: [
+    // Nest-specific Sentry instrumentation. Note the '/setup' subpath - the
+    // package root does not export SentryModule.
+    SentryModule.forRoot(),
     ScheduleModule.forRoot(),
     ConfigModule.forRoot({
       isGlobal: true,

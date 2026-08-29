@@ -1,32 +1,19 @@
+// Must stay first: Sentry.init() runs here, and it has to happen before any
+// instrumented library (express, pg, http) is pulled into the require cache.
+import './instrument';
+
 import { NestFactory } from '@nestjs/core';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { AppModule } from './app.module';
 
 import { ValidationPipe, Logger } from '@nestjs/common';
 import { AllExceptionsFilter } from './common/filters/http-exception.filter';
-import * as Sentry from '@sentry/nestjs';
-import { nodeProfilingIntegration } from '@sentry/profiling-node';
 
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
 
-  // Initialize Sentry. Sampling is deliberately low in production: the
-  // reminder cron alone opens a transaction every 60s, so tracing everything
-  // burns the quota on background noise rather than on real user traffic.
-  // Override with SENTRY_TRACES_SAMPLE_RATE when actively debugging.
+  // Sentry.init() already ran in ./instrument, imported above.
   const isProduction = process.env.NODE_ENV === 'production';
-  const sampleRate = process.env.SENTRY_TRACES_SAMPLE_RATE
-    ? Number(process.env.SENTRY_TRACES_SAMPLE_RATE)
-    : isProduction
-      ? 0.1
-      : 1.0;
-
-  Sentry.init({
-    dsn: process.env.SENTRY_DSN,
-    integrations: [nodeProfilingIntegration()],
-    tracesSampleRate: sampleRate,
-    profilesSampleRate: sampleRate,
-  });
 
   const app = await NestFactory.create(AppModule);
 

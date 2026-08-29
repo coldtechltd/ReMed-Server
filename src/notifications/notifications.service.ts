@@ -1,5 +1,6 @@
 import { Injectable, Inject, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
+import { SentryCron } from '@sentry/nestjs';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import {
   eq,
@@ -54,6 +55,12 @@ export class NotificationsService {
   }
 
   @Cron(CronExpression.EVERY_MINUTE)
+  @SentryCron('send-dose-reminders', {
+    schedule: { type: 'crontab', value: '*/1 * * * *' },
+    checkinMargin: 2,
+    maxRuntime: 5,
+    timezone: 'UTC',
+  })
   async handleReminders() {
     this.logger.debug('Checking for pending dose events to send reminders...');
     const now = new Date();
@@ -188,6 +195,12 @@ export class NotificationsService {
    * again.
    */
   @Cron(CronExpression.EVERY_DAY_AT_9AM)
+  @SentryCron('send-refill-reminders', {
+    schedule: { type: 'crontab', value: '0 9 * * *' },
+    checkinMargin: 60,
+    maxRuntime: 15,
+    timezone: 'UTC',
+  })
   async handleRefillReminders() {
     this.logger.debug('Checking for medications that need a refill...');
 
@@ -460,6 +473,12 @@ export class NotificationsService {
   // per-instance, so every replica must poll receipts for the tickets *it*
   // sent. Running everywhere is correct here, not a double-fire.
   @Cron(CronExpression.EVERY_10_MINUTES)
+  @SentryCron('poll-push-receipts', {
+    schedule: { type: 'crontab', value: '*/10 * * * *' },
+    checkinMargin: 5,
+    maxRuntime: 5,
+    timezone: 'UTC',
+  })
   async handlePushReceipts() {
     if (this.pendingReceipts.length === 0) return;
 

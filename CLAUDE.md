@@ -29,7 +29,8 @@ Copy `.env.example` → `.env`. `DATABASE_URL`, `JWT_SECRET`, `GROQ_API_KEY` are
 - `ValidationPipe` with `whitelist + forbidNonWhitelisted + transform` — **an undeclared field in a request body is a 400, so every accepted field must exist on a DTO.**
 - `ThrottlerGuard`, 100 req/min/IP globally; tightened per-route with `@Throttle` (auth login/register 5/min, all AI routes 20/min).
 - `AuditInterceptor` — logs every mutation plus any access to `/medication`, `/condition`, `/profile`, `/dose-event`, `/reminder`.
-- `AllExceptionsFilter`, CORS from a comma-separated `FRONTEND_URL` allowlist, Sentry (sample rate defaults to 0.1 in production — the per-minute cron would otherwise eat the quota).
+- `AllExceptionsFilter`, CORS from a comma-separated `FRONTEND_URL` allowlist.
+- Sentry, wired in four places: `src/instrument.ts` (**imported on main.ts's first line** — the SDK patches express/pg through a require hook, so an init that runs after `import { AppModule }` produces traces with no DB spans; it also calls `dotenv.config()` itself, because `ConfigModule` has not run yet and an unset `SENTRY_DSN` makes the SDK silently no-op), `SentryModule.forRoot()` in `app.module.ts` (note the `@sentry/nestjs/setup` subpath — the package root does not export it), `@SentryExceptionCaptured()` on `AllExceptionsFilter.catch` (**without it the bare `@Catch()` filter swallows every request error before Sentry sees it**), and `@SentryCron` on the six cron jobs. Sample rate defaults to 0.1 in production — the per-minute cron would otherwise eat the quota.
 
 **Database access** is one `@Global` provider: `@Inject(DRIZZLE_CLIENT) db: NodePgDatabase<typeof schema>`. No repositories — services query Drizzle directly. Schema files are `src/db/schema/*.ts`, re-exported via `index.ts` and imported as `* as schema`. Services that write across tables take a `DrizzleExecutor` (root client *or* transaction handle) so they compose inside `db.transaction`.
 
@@ -60,16 +61,16 @@ Pure timing math is `src/schedule/schedule.util.ts`: 90-day rolling horizon, 48h
 
 ### Cron jobs
 
-All `@nestjs/schedule` decorators, so they run **in-process on every instance** — running multiple replicas double-fires them.
+All `@nestjs/schedule` decorators, so they run **in-process on every instance** — running multiple replicas double-fires them. Each carries a `@SentryCron` check-in whose slug is listed below; the monitors are created in Sentry on first check-in, and their `timezone: 'UTC'` must match the deploy box's clock or Sentry will alert on jobs that ran perfectly well.
 
-| When | Where | What |
-|---|---|---|
-| every minute | `notifications.service.ts` | send due reminders (skips doses >2h stale) |
-| every 10 min | `notifications.service.ts` | poll Expo push receipts, clear disowned tokens |
-| hourly | `schedule.service.ts` | mark doses missed after a 2h grace window |
-| daily 00:00 | `schedule.service.ts` | top up the dose-event horizon |
-| daily 01:00 | `medication.service.ts` | auto-complete finished courses (after generation) |
-| daily 09:00 | `notifications.service.ts` | refill reminders, 5 days ahead of projected run-out |
+| When | Where | Monitor slug | What |
+|---|---|---|---|
+| every minute | `notifications.service.ts` | `send-dose-reminders` | send due reminders (skips doses >2h stale) |
+| every 10 min | `notifications.service.ts` | `poll-push-receipts` | poll Expo push receipts, clear disowned tokens |
+| hourly | `schedule.service.ts` | `mark-missed-doses` | mark doses missed after a 2h grace window |
+| daily 00:00 | `schedule.service.ts` | `dose-horizon-topup` | top up the dose-event horizon |
+| daily 01:00 | `medication.service.ts` | `course-completion` | auto-complete finished courses (after generation) |
+| daily 09:00 | `notifications.service.ts` | `send-refill-reminders` | refill reminders, 5 days ahead of projected run-out |
 
 Cron bodies catch DB connectivity codes (`ETIMEDOUT` / `ENOTFOUND` / `XX000`) and log a warning rather than throwing — a pooler blip shouldn't surface as an unhandled cron exception every minute.
 

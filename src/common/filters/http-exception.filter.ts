@@ -1,17 +1,19 @@
-import {
-  ExceptionFilter,
-  Catch,
-  ArgumentsHost,
-  HttpException,
-  HttpStatus,
-  Logger,
-} from '@nestjs/common';
+import { Catch, HttpException, HttpStatus, Logger } from '@nestjs/common';
+// @SentryExceptionCaptured() emits decorator metadata for this signature, which
+// requires the referenced types to be imported as types under isolatedModules.
+import type { ArgumentsHost, ExceptionFilter } from '@nestjs/common';
+import { SentryExceptionCaptured } from '@sentry/nestjs';
 import { Request, Response } from 'express';
 
 @Catch()
 export class AllExceptionsFilter implements ExceptionFilter {
   private readonly logger = new Logger(AllExceptionsFilter.name);
 
+  // This filter is registered with a bare @Catch(), so it intercepts *every*
+  // exception before any other filter could. Without this decorator Sentry
+  // never sees a single request error - they would only ever reach the local
+  // logger below.
+  @SentryExceptionCaptured()
   catch(exception: unknown, host: ArgumentsHost) {
     const ctx = host.switchToHttp();
     const response = ctx.getResponse<Response>();

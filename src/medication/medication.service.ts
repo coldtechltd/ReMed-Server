@@ -6,6 +6,7 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
+import { SentryCron } from '@sentry/nestjs';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { eq, and, lt, desc, isNotNull, inArray } from 'drizzle-orm';
 import * as schema from '../db/schema';
@@ -386,6 +387,12 @@ export class MedicationService {
    * cleaned up rather than topped up.
    */
   @Cron(CronExpression.EVERY_DAY_AT_1AM)
+  @SentryCron('course-completion', {
+    schedule: { type: 'crontab', value: '0 1 * * *' },
+    checkinMargin: 60,
+    maxRuntime: 15,
+    timezone: 'UTC',
+  })
   async handleCourseCompletion() {
     try {
       if (!(await this.cronLock.claim('course-completion', 86_400_000)))
