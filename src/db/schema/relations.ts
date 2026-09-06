@@ -7,6 +7,7 @@ import { dosageForms } from './dosageForm';
 import { schedules } from './schedule';
 import { doseEvents } from './doseEvent';
 import { countries } from './country';
+import { companionLinks } from './companion-link';
 
 export const usersRelations = relations(users, ({ one, many }) => ({
   profile: one(profiles, {
@@ -15,6 +16,23 @@ export const usersRelations = relations(users, ({ one, many }) => ({
   }),
   medications: many(medications),
   deviceSessions: many(deviceSessions),
+  // Two self-referential edges, so they need explicit relation names to tell
+  // drizzle which FK each side belongs to.
+  sharedWith: many(companionLinks, { relationName: 'owner' }),
+  following: many(companionLinks, { relationName: 'companion' }),
+}));
+
+export const companionLinksRelations = relations(companionLinks, ({ one }) => ({
+  owner: one(users, {
+    fields: [companionLinks.ownerId],
+    references: [users.id],
+    relationName: 'owner',
+  }),
+  companion: one(users, {
+    fields: [companionLinks.companionId],
+    references: [users.id],
+    relationName: 'companion',
+  }),
 }));
 
 export const deviceSessionsRelations = relations(deviceSessions, ({ one }) => ({

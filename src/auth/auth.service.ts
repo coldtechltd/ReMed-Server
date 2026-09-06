@@ -6,7 +6,7 @@ import {
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
 
 import { Inject } from '@nestjs/common';
-import { and, desc, eq, gt, inArray, isNull, sql } from 'drizzle-orm';
+import { and, desc, eq, gt, inArray, isNull, or, sql } from 'drizzle-orm';
 import {
   users,
   profiles,
@@ -20,6 +20,7 @@ import {
   entitlements,
   passwordResetTokens,
   consentRecords,
+  companionLinks,
 } from '../db/schema';
 import * as bcrypt from 'bcrypt';
 import { randomInt } from 'crypto';
@@ -226,13 +227,9 @@ export class AuthService {
             await tx
               .delete(doseEvents)
               .where(inArray(doseEvents.scheduleId, schedIds));
-            await tx
-              .delete(schedules)
-              .where(inArray(schedules.id, schedIds));
+            await tx.delete(schedules).where(inArray(schedules.id, schedIds));
           }
-          await tx
-            .delete(dosageForms)
-            .where(inArray(dosageForms.id, formIds));
+          await tx.delete(dosageForms).where(inArray(dosageForms.id, formIds));
         }
         await tx.delete(medications).where(eq(medications.userId, userId));
       }
@@ -243,13 +240,20 @@ export class AuthService {
       await tx
         .delete(passwordResetTokens)
         .where(eq(passwordResetTokens.userId, userId));
+      await tx.delete(consentRecords).where(eq(consentRecords.userId, userId));
+      // Both directions: links this user granted, and links granted to them.
+      // Missing either side leaves an FK pointing at a deleted user and the
+      // whole account deletion fails.
       await tx
-        .delete(consentRecords)
-        .where(eq(consentRecords.userId, userId));
+        .delete(companionLinks)
+        .where(
+          or(
+            eq(companionLinks.ownerId, userId),
+            eq(companionLinks.companionId, userId),
+          ),
+        );
       await tx.delete(profiles).where(eq(profiles.userId, userId));
-      await tx
-        .delete(deviceSessions)
-        .where(eq(deviceSessions.userId, userId));
+      await tx.delete(deviceSessions).where(eq(deviceSessions.userId, userId));
       await tx.delete(users).where(eq(users.id, userId));
     });
     return { success: true };
@@ -299,8 +303,7 @@ export class AuthService {
   async resetPassword(email: string, code: string, newPassword: string) {
     // One generic error for every failure mode, so responses can't be used
     // to probe which addresses exist or whether a code was "close".
-    const invalid = () =>
-      new UnauthorizedException('Invalid or expired code');
+    const invalid = () => new UnauthorizedException('Invalid or expired code');
 
     const [user] = await this.db
       .select()
@@ -366,7 +369,10 @@ export class AuthService {
       this.config.get<string>('GOOGLE_IOS_CLIENT_ID'),
       this.config.get<string>('GOOGLE_ANDROID_CLIENT_ID'),
     ].filter(Boolean);
-    if (allowedAudiences.length === 0 || !allowedAudiences.includes(payload.aud)) {
+    if (
+      allowedAudiences.length === 0 ||
+      !allowedAudiences.includes(payload.aud)
+    ) {
       throw new UnauthorizedException('Invalid Google token');
     }
     if (payload.email_verified !== 'true' || !payload.email) {
@@ -382,9 +388,7 @@ export class AuthService {
   private async verifyAppleIdentityToken(
     identityToken: string,
   ): Promise<{ oauthId: string; email: string }> {
-    const decoded = this.jwt.decode(identityToken, { complete: true }) as {
-      header?: { kid?: string };
-    } | null;
+    const decoded = this.jwt.decode(identityToken, { complete: true });
     const kid = decoded?.header?.kid;
     if (!kid) throw new UnauthorizedException('Invalid Apple token');
 

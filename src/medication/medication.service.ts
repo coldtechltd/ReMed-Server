@@ -71,6 +71,7 @@ export class MedicationService {
           type,
           startDate: new Date(dto.startDate),
           endDate,
+          isPrivate: dto.isPrivate ?? false,
         })
         .returning();
 
@@ -135,28 +136,43 @@ export class MedicationService {
         type,
         startDate: new Date(createMedicationDto.startDate),
         endDate,
+        isPrivate: createMedicationDto.isPrivate ?? false,
       })
       .returning();
 
     return medication;
   }
 
-  async findAllByUser(userId: string, status?: MedicationStatus) {
+  /**
+   * `excludePrivate` is set by companion reads: medications the owner marked
+   * private stay invisible to everyone but the owner. Owner-side callers pass
+   * nothing and get exactly the query they always got.
+   */
+  async findAllByUser(
+    userId: string,
+    status?: MedicationStatus,
+    opts?: { excludePrivate?: boolean },
+  ) {
     return this.db
       .select()
       .from(schema.medications)
       .where(
-        status
-          ? and(
-              eq(schema.medications.userId, userId),
-              eq(schema.medications.status, status),
-            )
-          : eq(schema.medications.userId, userId),
+        and(
+          eq(schema.medications.userId, userId),
+          ...(status ? [eq(schema.medications.status, status)] : []),
+          ...(opts?.excludePrivate
+            ? [eq(schema.medications.isPrivate, false)]
+            : []),
+        ),
       )
       .orderBy(desc(schema.medications.createdAt));
   }
 
-  async findOne(id: string, userId: string) {
+  async findOne(
+    id: string,
+    userId: string,
+    opts?: { excludePrivate?: boolean },
+  ) {
     const [medication] = await this.db
       .select()
       .from(schema.medications)
@@ -164,6 +180,9 @@ export class MedicationService {
         and(
           eq(schema.medications.id, id),
           eq(schema.medications.userId, userId),
+          ...(opts?.excludePrivate
+            ? [eq(schema.medications.isPrivate, false)]
+            : []),
         ),
       )
       .limit(1);
@@ -192,6 +211,10 @@ export class MedicationService {
       updateData.notes = updateMedicationDto.notes;
     if (updateMedicationDto.startDate !== undefined)
       updateData.startDate = new Date(updateMedicationDto.startDate);
+    // The companion-sharing opt-out. Toggling it takes effect on the next read;
+    // nothing needs regenerating, since it only ever filters queries.
+    if (updateMedicationDto.isPrivate !== undefined)
+      updateData.isPrivate = updateMedicationDto.isPrivate;
 
     // Type and endDate are coupled, so resolve them together against the merged
     // state: changing only the type must drag endDate along with it.
@@ -395,8 +418,7 @@ export class MedicationService {
   })
   async handleCourseCompletion() {
     try {
-      if (!(await this.cronLock.claim('course-completion', 86_400_000)))
-        return;
+      if (!(await this.cronLock.claim('course-completion', 86_400_000))) return;
       this.logger.log('Checking for treatment courses that have ended...');
       const now = new Date();
 

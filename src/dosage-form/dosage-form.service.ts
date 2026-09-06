@@ -41,9 +41,14 @@ export class DosageFormService {
     return form;
   }
 
-  async findAllByMedication(medicationId: string, userId: string) {
-    // Ensure user owns medication
-    await this.medicationService.findOne(medicationId, userId);
+  async findAllByMedication(
+    medicationId: string,
+    userId: string,
+    opts?: { excludePrivate?: boolean },
+  ) {
+    // Ensure user owns medication. With excludePrivate this also 404s a
+    // private medication, so a companion can't reach its forms by id.
+    await this.medicationService.findOne(medicationId, userId, opts);
 
     return this.db
       .select()

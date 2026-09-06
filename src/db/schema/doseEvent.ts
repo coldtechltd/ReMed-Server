@@ -23,6 +23,10 @@ export const doseEvents = pgTable(
     takenAt: timestamp('taken_at'),
     status: varchar('status', { length: 50 }).default('pending'), // pending | taken | missed
     reminderSent: boolean('reminder_sent').default(false),
+    // Latch for the companion missed-dose alert. Deliberately NOT reminderSent:
+    // that one is the owner's due-reminder flag and is already true by the time
+    // a dose is marked missed, so reusing it would suppress every alert.
+    companionAlertSentAt: timestamp('companion_alert_sent_at'),
     snoozeCount: integer('snooze_count').default(0).notNull(),
     createdAt: timestamp('created_at').defaultNow(),
   },

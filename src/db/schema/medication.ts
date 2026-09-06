@@ -4,6 +4,7 @@ import {
   varchar,
   text,
   timestamp,
+  boolean,
   index,
 } from 'drizzle-orm/pg-core';
 import { users } from './user';
@@ -26,6 +27,10 @@ export const medications = pgTable(
     startDate: timestamp('start_date').notNull(),
     endDate: timestamp('end_date'),
     completedAt: timestamp('completed_at'),
+    // Hidden from companions (see companion_links). Sensitive prescriptions are
+    // the reason people decline to share at all, so the opt-out is per
+    // medication rather than all-or-nothing.
+    isPrivate: boolean('is_private').default(false).notNull(),
     createdAt: timestamp('created_at').defaultNow(),
   },
   (table) => [

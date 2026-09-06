@@ -1,4 +1,5 @@
 import {
+  IsBoolean,
   IsString,
   IsNotEmpty,
   IsOptional,
@@ -60,4 +61,14 @@ export class CreateMedicationDto {
   @IsDateString()
   @IsNotEmpty()
   endDate?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Hide this medication from companions. Private medications are excluded ' +
+      'from every companion read and from their missed-dose and refill alerts.',
+    default: false,
+  })
+  @IsOptional()
+  @IsBoolean()
+  isPrivate?: boolean;
 }

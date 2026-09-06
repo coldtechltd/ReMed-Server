@@ -1,5 +1,10 @@
 import { HttpException } from '@nestjs/common';
-import { EntitlementService, QUOTAS } from './entitlement.service';
+import {
+  COMPANION_LIMITS,
+  COMPANION_LIMIT_REACHED,
+  EntitlementService,
+  QUOTAS,
+} from './entitlement.service';
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -132,5 +137,78 @@ describe('EntitlementService.assertQuota', () => {
     await expect(svc.assertQuota('u1', 'tips')).rejects.toBeInstanceOf(
       HttpException,
     );
+  });
+});
+
+/**
+ * `assertCompanionLimit` reads entitlements (via getStatus, which ends in
+ * `.limit()`) and then counts companion_links (which awaits `.where()`
+ * directly). The chain therefore has to terminate at either point — but
+ * consume exactly one queued result per query, so `where()` resolves lazily
+ * rather than eagerly shifting.
+ */
+function companionDb(entitlementRow: Row, used: number) {
+  const queue: Row[] = [entitlementRow, { used }];
+  const take = () => (queue.length ? [queue.shift()] : []);
+
+  const chain: Record<string, unknown> = {
+    from: () => chain,
+    limit: () => Promise.resolve(take()),
+    where: () => whereResult,
+  };
+  // Chainable for getStatus's trailing `.limit()`, awaitable for the count
+  // query that ends at `where`.
+  const whereResult = {
+    ...chain,
+    then: (res: (v: Row[]) => unknown, rej: (e: unknown) => unknown) =>
+      Promise.resolve(take()).then(res, rej),
+  };
+
+  return { select: () => chain } as never;
+}
+
+describe('EntitlementService.assertCompanionLimit', () => {
+  const free = undefined;
+  const pro = {
+    tier: 'pro',
+    isLifetime: true,
+    expiresAt: null,
+    productId: 'p',
+  };
+
+  it('lets a free user create their first companion link', async () => {
+    const svc = new EntitlementService(companionDb(free, 0));
+    await expect(svc.assertCompanionLimit('u1')).resolves.toBe('free');
+  });
+
+  it('throws 402 once a free user has used their single seat', async () => {
+    const svc = new EntitlementService(
+      companionDb(free, COMPANION_LIMITS.free),
+    );
+    await expect(svc.assertCompanionLimit('u1')).rejects.toMatchObject({
+      response: { code: COMPANION_LIMIT_REACHED, tier: 'free', limit: 1 },
+    });
+  });
+
+  // The upgrade path: the same count that blocks a free user is fine on pro.
+  it('lets a pro user past the free ceiling', async () => {
+    const svc = new EntitlementService(companionDb(pro, COMPANION_LIMITS.free));
+    await expect(svc.assertCompanionLimit('u1')).resolves.toBe('pro');
+  });
+
+  it('still caps a pro user at their own limit', async () => {
+    const svc = new EntitlementService(companionDb(pro, COMPANION_LIMITS.pro));
+    await expect(svc.assertCompanionLimit('u1')).rejects.toBeInstanceOf(
+      HttpException,
+    );
+  });
+
+  // Distinct from AI_QUOTA_EXCEEDED so the app does not show AI-usage copy on
+  // the paywall it opens.
+  it('does not reuse the AI quota error code', async () => {
+    const svc = new EntitlementService(companionDb(free, 5));
+    await expect(svc.assertCompanionLimit('u1')).rejects.toMatchObject({
+      response: { code: 'COMPANION_LIMIT_REACHED' },
+    });
   });
 });

@@ -1,6 +1,6 @@
 import { HttpException, HttpStatus, Inject, Injectable } from '@nestjs/common';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
 
@@ -18,6 +18,25 @@ export const AI_QUOTA_EXCEEDED = 'AI_QUOTA_EXCEEDED';
 export const QUOTAS: Record<Tier, Record<AiCallKind, number>> = {
   free: { tips: 1, chat: 5 },
   pro: { tips: 20, chat: 200 },
+};
+
+/**
+ * Distinct from AI_QUOTA_EXCEEDED on purpose: the app's `isQuotaError()` guard
+ * matches that code and opens the paywall with AI-usage copy, which would be
+ * the wrong message here.
+ */
+export const COMPANION_LIMIT_REACHED = 'COMPANION_LIMIT_REACHED';
+
+/**
+ * How many people a user may share their medications WITH. Not a daily counter,
+ * so it deliberately sits outside QUOTAS (whose lookup is keyed to the
+ * ai_usage columns). Being someone else's companion is always free and
+ * unlimited — charging for that would break the caregiver case, which is
+ * usually why the second person installs the app at all.
+ */
+export const COMPANION_LIMITS: Record<Tier, number> = {
+  free: 1,
+  pro: 5,
 };
 
 export interface EntitlementStatus {
@@ -120,6 +139,44 @@ export class EntitlementService {
             tier === 'free'
               ? 'You have used your free AI allowance for today. Upgrade to ReMed Pro for more.'
               : 'Daily AI limit reached. Please try again tomorrow.',
+        },
+        HttpStatus.PAYMENT_REQUIRED,
+      );
+    }
+
+    return tier;
+  }
+
+  /**
+   * Throws 402 when the owner already has as many companion links as their
+   * tier allows. Pending invites count: an unredeemed code is a seat held.
+   */
+  async assertCompanionLimit(userId: string): Promise<Tier> {
+    const tier = await this.getTier(userId);
+    const limit = COMPANION_LIMITS[tier];
+
+    const [row] = await this.db
+      .select({ used: sql<number>`count(*)::int` })
+      .from(schema.companionLinks)
+      .where(
+        and(
+          eq(schema.companionLinks.ownerId, userId),
+          inArray(schema.companionLinks.status, ['pending', 'active']),
+        ),
+      );
+    const used = row?.used ?? 0;
+
+    if (used >= limit) {
+      throw new HttpException(
+        {
+          code: COMPANION_LIMIT_REACHED,
+          tier,
+          limit,
+          used,
+          message:
+            tier === 'free'
+              ? 'Free accounts can share with one companion. Upgrade to ReMed Pro to add more.'
+              : `You can share with up to ${limit} companions.`,
         },
         HttpStatus.PAYMENT_REQUIRED,
       );

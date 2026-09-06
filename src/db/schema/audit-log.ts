@@ -1,4 +1,11 @@
-import { pgTable, uuid, varchar, text, timestamp, index } from 'drizzle-orm/pg-core';
+import {
+  pgTable,
+  uuid,
+  varchar,
+  text,
+  timestamp,
+  index,
+} from 'drizzle-orm/pg-core';
 
 /**
  * Persisted trail of every mutation and every access to sensitive resources
@@ -11,6 +18,9 @@ export const auditLogs = pgTable(
   {
     id: uuid('id').defaultRandom().primaryKey(),
     userId: uuid('user_id'),
+    // Whose data was accessed, when that differs from the caller — i.e. a
+    // companion reading the owner's medications. Null for ordinary self-access.
+    subjectUserId: uuid('subject_user_id'),
     method: varchar('method', { length: 10 }).notNull(),
     url: text('url').notNull(),
     action: varchar('action', { length: 20 }).notNull(),

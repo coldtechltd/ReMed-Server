@@ -14,4 +14,5 @@ export * from './password-reset-token';
 export * from './cron-lock';
 export * from './audit-log';
 export * from './consent-record';
+export * from './companion-link';
 export * from './relations';

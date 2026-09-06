@@ -150,6 +150,14 @@ export class CreateFullMedicationDto {
   @IsNotEmpty()
   endDate?: string;
 
+  @ApiPropertyOptional({
+    description: 'Hide this medication from companions.',
+    default: false,
+  })
+  @IsOptional()
+  @IsBoolean()
+  isPrivate?: boolean;
+
   @ApiProperty({ type: [FullDosageFormDto] })
   @IsArray()
   @ArrayMinSize(1)

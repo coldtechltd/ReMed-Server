@@ -22,6 +22,11 @@ import {
   daysUntil,
   REFILL_LEAD_TIME_DAYS,
 } from '../dosage-form/stock.util';
+import {
+  companionMissedDoseCopy,
+  companionRefillCopy,
+  MissedDoseItem,
+} from '../companion/companion-notification.util';
 
 // A ticket only says Expo accepted the message; whether FCM/APNs actually
 // delivered it shows up minutes later in the receipt. Expo asks for a wait
@@ -30,6 +35,10 @@ const RECEIPT_CHECK_DELAY_MS = 5 * 60 * 1000;
 const RECEIPT_GIVE_UP_MS = 60 * 60 * 1000;
 // Guard against unbounded growth if the receipt API is down for a long stretch.
 const MAX_PENDING_RECEIPTS = 5000;
+
+// A dose marked missed more than a day ago is history, not news — alerting a
+// companion about it then is noise, and it also bounds this query's scan.
+const COMPANION_MISSED_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 
 interface PendingReceipt {
   ticketId: string;
@@ -183,6 +192,232 @@ export class NotificationsService {
   }
 
   /**
+   * Tells a companion when the person they care for has missed a dose.
+   *
+   * Deliberately its own job rather than a tail on `handleMissedDoseMarking`
+   * (schedule.service.ts): keeping them separate means a failed push doesn't
+   * lose the alert. `companionAlertSentAt` is stamped only once a message is
+   * accepted, so the next hourly run retries whatever is still null.
+   *
+   * Private medications never reach this query — see `medications.isPrivate`.
+   */
+  @Cron(CronExpression.EVERY_HOUR)
+  @SentryCron('companion-missed-dose-alerts', {
+    schedule: { type: 'crontab', value: '0 * * * *' },
+    checkinMargin: 15,
+    maxRuntime: 15,
+    timezone: 'UTC',
+  })
+  async handleCompanionMissedDoseAlerts() {
+    try {
+      if (
+        !(await this.cronLock.claim('companion-missed-dose-alerts', 3_600_000))
+      )
+        return;
+
+      const since = new Date(Date.now() - COMPANION_MISSED_LOOKBACK_MS);
+
+      const missed = await this.db
+        .select({
+          eventId: schema.doseEvents.id,
+          scheduledFor: schema.doseEvents.scheduledFor,
+          timezone: schema.schedules.timezone,
+          medicationName: schema.medications.name,
+          ownerId: schema.medications.userId,
+        })
+        .from(schema.doseEvents)
+        .innerJoin(
+          schema.schedules,
+          eq(schema.doseEvents.scheduleId, schema.schedules.id),
+        )
+        .innerJoin(
+          schema.dosageForms,
+          eq(schema.schedules.dosageFormId, schema.dosageForms.id),
+        )
+        .innerJoin(
+          schema.medications,
+          eq(schema.dosageForms.medicationId, schema.medications.id),
+        )
+        .where(
+          and(
+            eq(schema.doseEvents.status, 'missed'),
+            isNull(schema.doseEvents.companionAlertSentAt),
+            gte(schema.doseEvents.scheduledFor, since),
+            eq(schema.medications.isPrivate, false),
+          ),
+        );
+
+      if (missed.length === 0) return;
+
+      const ownerIds = [...new Set(missed.map((m) => m.ownerId))];
+
+      const links = await this.db
+        .select({
+          ownerId: schema.companionLinks.ownerId,
+          companionId: schema.companionLinks.companionId,
+        })
+        .from(schema.companionLinks)
+        .where(
+          and(
+            inArray(schema.companionLinks.ownerId, ownerIds),
+            eq(schema.companionLinks.status, 'active'),
+            eq(schema.companionLinks.notifyMissedDose, true),
+          ),
+        );
+
+      // Owners nobody is watching have nothing to retry, so stamp their events
+      // now rather than rescanning them every hour until they age out.
+      const watchedOwners = new Set(links.map((l) => l.ownerId));
+      const unwatched = missed
+        .filter((m) => !watchedOwners.has(m.ownerId))
+        .map((m) => m.eventId);
+      if (unwatched.length > 0) {
+        await this.db
+          .update(schema.doseEvents)
+          .set({ companionAlertSentAt: new Date() })
+          .where(inArray(schema.doseEvents.id, unwatched));
+      }
+
+      if (links.length === 0) return;
+
+      const companionIds = [
+        ...new Set(
+          links.map((l) => l.companionId).filter((id): id is string => !!id),
+        ),
+      ];
+
+      const devices = await this.db
+        .select()
+        .from(schema.deviceSessions)
+        .where(
+          and(
+            inArray(schema.deviceSessions.userId, companionIds),
+            isNotNull(schema.deviceSessions.expoPushToken),
+          ),
+        );
+      if (devices.length === 0) return;
+
+      const devicesByUser = new Map<string, typeof devices>();
+      for (const device of devices) {
+        const list = devicesByUser.get(device.userId) ?? [];
+        list.push(device);
+        devicesByUser.set(device.userId, list);
+      }
+
+      const ownerNames = await this.db
+        .select({
+          userId: schema.profiles.userId,
+          fullName: schema.profiles.fullName,
+        })
+        .from(schema.profiles)
+        .where(inArray(schema.profiles.userId, [...watchedOwners]));
+      const nameByOwner = new Map(
+        ownerNames.map((p) => [p.userId, p.fullName]),
+      );
+
+      // Grouped per (companion, owner): someone caring for two people gets one
+      // message about each, never a single message mixing both names.
+      const groups = new Map<
+        string,
+        {
+          companionId: string;
+          ownerId: string;
+          items: MissedDoseItem[];
+          eventIds: string[];
+          timezone: string | null;
+        }
+      >();
+
+      for (const link of links) {
+        if (!link.companionId) continue;
+        for (const m of missed) {
+          if (m.ownerId !== link.ownerId) continue;
+          const key = `${link.companionId}:${link.ownerId}`;
+          const group = groups.get(key) ?? {
+            companionId: link.companionId,
+            ownerId: link.ownerId,
+            items: [],
+            eventIds: [],
+            timezone: m.timezone,
+          };
+          group.items.push({
+            medicationName: m.medicationName,
+            scheduledFor: m.scheduledFor,
+          });
+          group.eventIds.push(m.eventId);
+          groups.set(key, group);
+        }
+      }
+
+      const messages: ExpoPushMessage[] = [];
+      const eventIdsPerMessage: string[][] = [];
+
+      for (const group of groups.values()) {
+        const { title, body } = companionMissedDoseCopy(
+          nameByOwner.get(group.ownerId),
+          group.items,
+          group.timezone,
+        );
+
+        for (const device of devicesByUser.get(group.companionId) ?? []) {
+          const pushToken = device.expoPushToken;
+          if (!Expo.isExpoPushToken(pushToken)) {
+            this.logger.error(
+              `Push token ${pushToken} is not a valid Expo push token`,
+            );
+            continue;
+          }
+
+          messages.push({
+            to: pushToken,
+            sound: 'default',
+            title,
+            body,
+            // ownerId drives the deep link into that person's shared view.
+            data: { type: 'companion_missed_dose', ownerId: group.ownerId },
+            categoryId: 'companion_missed_dose',
+            // Its own Android channel, so a companion can mute these without
+            // silencing their own dose reminders.
+            channelId: 'companion',
+          });
+          eventIdsPerMessage.push(group.eventIds);
+        }
+      }
+
+      if (messages.length === 0) return;
+
+      const results = await this.sendPush(messages);
+      const sentEventIds = [
+        ...new Set(
+          eventIdsPerMessage.flatMap((ids, i) => (results[i] ? ids : [])),
+        ),
+      ];
+
+      if (sentEventIds.length > 0) {
+        await this.db
+          .update(schema.doseEvents)
+          .set({ companionAlertSentAt: new Date() })
+          .where(inArray(schema.doseEvents.id, sentEventIds));
+      }
+
+      this.logger.log(
+        `Companion missed-dose alerts: ${messages.length} message(s) covering ${sentEventIds.length} dose(s).`,
+      );
+    } catch (error: any) {
+      const code = error?.cause?.code;
+      if (code === 'ETIMEDOUT' || code === 'ENOTFOUND' || code === 'XX000') {
+        this.logger.warn(
+          `Database unavailable during companion alerts (${code}). Retrying next hour.`,
+        );
+      } else {
+        this.logger.error(
+          `Error during companion missed-dose alerts: ${error.message || error}`,
+        );
+      }
+    }
+  }
+
+  /**
    * Once a day, warn about tracked stock that is about to run out.
    *
    * Predictive rather than threshold-based: the run-out date is projected from the
@@ -205,8 +440,7 @@ export class NotificationsService {
     this.logger.debug('Checking for medications that need a refill...');
 
     try {
-      if (!(await this.cronLock.claim('refill-reminders', 86_400_000)))
-        return;
+      if (!(await this.cronLock.claim('refill-reminders', 86_400_000))) return;
       const now = new Date();
       const throttleCutoff = new Date(now.getTime() - 20 * 60 * 60 * 1000);
       const leadCutoff = new Date(
@@ -320,13 +554,63 @@ export class NotificationsService {
 
       if (dueForms.length === 0) return;
 
+      const dueOwnerIds = [
+        ...new Set(dueForms.map((f) => f.medication.userId)),
+      ];
+
+      // Companions opted into refill alerts get the same warning, so someone
+      // can reorder before the person they care for runs out.
+      const refillLinks = await this.db
+        .select({
+          ownerId: schema.companionLinks.ownerId,
+          companionId: schema.companionLinks.companionId,
+        })
+        .from(schema.companionLinks)
+        .where(
+          and(
+            inArray(schema.companionLinks.ownerId, dueOwnerIds),
+            eq(schema.companionLinks.status, 'active'),
+            eq(schema.companionLinks.notifyRefill, true),
+          ),
+        );
+
+      const companionsByOwner = new Map<string, string[]>();
+      for (const link of refillLinks) {
+        if (!link.companionId) continue;
+        const list = companionsByOwner.get(link.ownerId) ?? [];
+        list.push(link.companionId);
+        companionsByOwner.set(link.ownerId, list);
+      }
+
+      const ownerNamesForRefill = refillLinks.length
+        ? await this.db
+            .select({
+              userId: schema.profiles.userId,
+              fullName: schema.profiles.fullName,
+            })
+            .from(schema.profiles)
+            .where(
+              inArray(schema.profiles.userId, [
+                ...new Set(refillLinks.map((l) => l.ownerId)),
+              ]),
+            )
+        : [];
+      const refillNameByOwner = new Map(
+        ownerNamesForRefill.map((p) => [p.userId, p.fullName]),
+      );
+
       const devices = await this.db
         .select()
         .from(schema.deviceSessions)
         .where(
           and(
             inArray(schema.deviceSessions.userId, [
-              ...new Set(dueForms.map((f) => f.medication.userId)),
+              ...new Set([
+                ...dueOwnerIds,
+                ...refillLinks
+                  .map((l) => l.companionId)
+                  .filter((id): id is string => !!id),
+              ]),
             ]),
             isNotNull(schema.deviceSessions.expoPushToken),
           ),
@@ -388,6 +672,40 @@ export class NotificationsService {
             channelId: 'refill',
           });
           formIdPerMessage.push(form.id);
+        }
+
+        // Same shortfall, phrased about the owner rather than to them. Private
+        // medications are excluded: a companion can't see them at all.
+        if (!medication.isPrivate) {
+          const companionCopy = companionRefillCopy(
+            refillNameByOwner.get(medication.userId),
+            medication.name,
+            runsOutAt ? daysUntil(runsOutAt, now) : null,
+          );
+
+          for (const companionId of companionsByOwner.get(medication.userId) ??
+            []) {
+            for (const device of devicesByUser.get(companionId) ?? []) {
+              const pushToken = device.expoPushToken;
+              if (!Expo.isExpoPushToken(pushToken)) continue;
+
+              messages.push({
+                to: pushToken,
+                sound: 'default',
+                title: companionCopy.title,
+                body: companionCopy.body,
+                data: {
+                  type: 'companion_refill',
+                  ownerId: medication.userId,
+                },
+                categoryId: 'companion_refill',
+                channelId: 'companion',
+              });
+              // Shares the owner's refillReminderSentAt latch: both are sent in
+              // the same run, so one throttle covers everyone.
+              formIdPerMessage.push(form.id);
+            }
+          }
         }
       }
 

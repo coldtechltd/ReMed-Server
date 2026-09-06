@@ -15,7 +15,7 @@
 export const COMPANY_NAME = 'ColdTech';
 export const CONTACT_EMAIL = 'coldtechltd01@gmail.com';
 export const APP_NAME = 'ReMed';
-export const LAST_UPDATED = '29 August 2026';
+export const LAST_UPDATED = '5 September 2026';
 
 function page(title: string, body: string): string {
   return `<!doctype html>
@@ -87,6 +87,20 @@ export const PRIVACY_POLICY_HTML = page(
   <li><strong>Apple and Google</strong> — process any subscription purchase. They handle your payment details directly; we never see your card.</li>
 </ul>
 <p>We may also disclose information where we are legally required to.</p>
+
+<h2>Sharing with a companion</h2>
+<p>You can invite someone — a partner, a family member, a carer — to follow your medications. Nothing is shared until you create an invite and they accept it, and you can end the sharing at any time from Settings.</p>
+<p>While a companion link is active, that person can see:</p>
+<ul>
+  <li>your medications and their dosage forms, doses and schedules;</li>
+  <li>your doses for a given day, your upcoming doses, and whether each was taken or missed;</li>
+  <li>your adherence statistics, including streaks and a per-medication breakdown;</li>
+  <li>your name, so they know whose information they are looking at.</li>
+</ul>
+<p>A companion cannot change anything. They cannot see the rest of your profile — your date of birth, blood group, genotype, height, weight, allergies, conditions, phone number or emergency contacts — and they cannot see your conversations with the assistant.</p>
+<p>You can hide any individual medication from companions by marking it private, and a private medication is excluded from everything above, including alerts.</p>
+<p>If they turn the alerts on, a companion also receives a push notification when you miss a dose and when a medication is running low. Those notifications name the medication concerned, so they can appear on their lock screen.</p>
+<p>Either of you can end the link at any time, and access stops immediately. Because this is your health information being shared with another person, we record when a companion views your data.</p>
 
 <h2>Security</h2>
 <p>Your session token is held in the device's secure keystore (Keychain on iOS, Keystore on Android), not in ordinary app storage. You can additionally require Face ID, Touch ID, or your device passcode to open the app; that check happens entirely on your device and no biometric data ever reaches us. Traffic to our servers is encrypted in transit.</p>

@@ -16,6 +16,7 @@ import { NotificationsModule } from './notifications/notifications.module';
 import { AiModule } from './ai/ai.module';
 import { LegalModule } from './legal/legal.module';
 import { BillingModule } from './billing/billing.module';
+import { CompanionModule } from './companion/companion.module';
 import { CronLockModule } from './common/cron-lock/cron-lock.module';
 import { MailModule } from './common/mail/mail.module';
 
@@ -48,6 +49,7 @@ import { AuditInterceptor } from './common/interceptors/audit.interceptor';
     AiModule,
     LegalModule,
     BillingModule,
+    CompanionModule,
   ],
   providers: [
     {

@@ -34,6 +34,7 @@ export class AuditInterceptor implements NestInterceptor {
       '/profile',
       '/dose-event',
       '/reminder',
+      '/companion',
     ];
 
     const isSensitive = sensitiveResources.some((res) => url.includes(res));
@@ -42,11 +43,18 @@ export class AuditInterceptor implements NestInterceptor {
       tap(() => {
         if (isSensitive || method !== 'GET') {
           const action = this.getActionLabel(method);
+          // Set by CompanionAccessGuard, which runs before interceptors. When
+          // present the caller is reading someone else's health data, and both
+          // parties have to be on the record — the audit trail is what makes
+          // the sharing feature defensible.
+          const subjectUserId: string | null =
+            request.companionLink?.ownerId ?? null;
           // Log actions on sensitive data or any state-changing action
           this.logger.log(
             JSON.stringify({
               timestamp,
               userId: userId ?? 'anonymous',
+              subjectUserId,
               method,
               url,
               action,
@@ -58,6 +66,7 @@ export class AuditInterceptor implements NestInterceptor {
             .insert(schema.auditLogs)
             .values({
               userId: userId ?? null,
+              subjectUserId,
               method,
               url,
               action,

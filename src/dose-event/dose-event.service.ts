@@ -32,6 +32,17 @@ export class DoseEventService {
    * the adherence numbers. `coalesce` keeps legacy rows with a null
    * `completedAt` visible rather than hiding their whole history.
    */
+  /**
+   * Extra filter for companion reads: medications the owner marked private are
+   * invisible to everyone but the owner. Returns [] for the owner's own reads
+   * so the query is byte-for-byte what it was before.
+   */
+  private privacyFilter(opts?: { excludePrivate?: boolean }) {
+    return opts?.excludePrivate
+      ? [eq(schema.medications.isPrivate, false)]
+      : [];
+  }
+
   private readonly notStoppedBefore = sql`(
     ${schema.medications.status} <> 'completed'
     OR ${schema.doseEvents.scheduledFor} <= coalesce(${schema.medications.completedAt}, ${schema.doseEvents.scheduledFor})
@@ -74,7 +85,13 @@ export class DoseEventService {
 
   async getUpcoming(
     userId: string,
-    opts?: { from?: string; days?: number; limit?: number; tz?: string },
+    opts?: {
+      from?: string;
+      days?: number;
+      limit?: number;
+      tz?: string;
+      excludePrivate?: boolean;
+    },
   ) {
     // Optional window. Callers that pass nothing (the app's "N remaining"
     // badge) keep the original unbounded behaviour; the widget snapshot passes
@@ -88,6 +105,7 @@ export class DoseEventService {
       // schedule or a completed course, and its Take button would PATCH it.
       eq(schema.schedules.isActive, true),
       eq(schema.medications.status, 'active'),
+      ...this.privacyFilter(opts),
     ];
 
     if (opts?.from) {
@@ -144,7 +162,12 @@ export class DoseEventService {
     }));
   }
 
-  async findEventsByDate(userId: string, dateStr: string, tz?: string) {
+  async findEventsByDate(
+    userId: string,
+    dateStr: string,
+    tz?: string,
+    opts?: { excludePrivate?: boolean },
+  ) {
     // With a tz, "the day" is the user's calendar day, not the server's —
     // otherwise doses near midnight land on the wrong date in the app.
     let startOfDay: Date;
@@ -186,6 +209,7 @@ export class DoseEventService {
           gte(schema.doseEvents.scheduledFor, startOfDay),
           lte(schema.doseEvents.scheduledFor, endOfDay),
           this.notStoppedBefore,
+          ...this.privacyFilter(opts),
         ),
       )
       .orderBy(schema.doseEvents.scheduledFor);
@@ -225,6 +249,7 @@ export class DoseEventService {
     fromStr?: string,
     toStr?: string,
     tz?: string,
+    opts?: { excludePrivate?: boolean },
   ) {
     // Default window: last 30 days (inclusive of today). With a tz, both the
     // window bounds and the per-day buckets below use the user's calendar
@@ -233,7 +258,11 @@ export class DoseEventService {
     const toBounds = tz
       ? this.dayBoundsInTz(toStr ?? dayKeyInTz(new Date(), tz), tz)
       : null;
-    const to = toBounds ? toBounds.endOfDay : toStr ? new Date(toStr) : new Date();
+    const to = toBounds
+      ? toBounds.endOfDay
+      : toStr
+        ? new Date(toStr)
+        : new Date();
     if (!toBounds) to.setHours(23, 59, 59, 999);
 
     const defaultFromInstant = new Date(
@@ -274,6 +303,7 @@ export class DoseEventService {
           gte(schema.doseEvents.scheduledFor, from),
           lte(schema.doseEvents.scheduledFor, to),
           this.notStoppedBefore,
+          ...this.privacyFilter(opts),
         ),
       );
 
