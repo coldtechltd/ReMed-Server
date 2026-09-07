@@ -63,7 +63,34 @@ ADDING A MEDICATION REMINDER:
 - Only call create_medication on a LATER turn, after the user has explicitly confirmed (e.g. "yes", "go ahead", "confirm") the proposal from your immediately preceding message. Never call create_medication in the same turn as propose_medication, and never without a clear confirmation.
 - If the user asks to change something before confirming, call propose_medication again with the corrected details.`;
 
-const MODEL = 'llama-3.3-70b-versatile';
+// Groq decommissioned `llama-3.3-70b-versatile` — requests for it now come
+// back 404 `model_not_found`, which surfaced in the app as "Couldn't load
+// tips. Try again." on every AI call. gpt-oss-120b is its tool-calling
+// replacement on Groq. It is a reasoning model, so its hidden reasoning
+// tokens count against `max_tokens`: keep `reasoning_effort: 'low'` on every
+// call and leave headroom in the budgets below, or replies get truncated
+// before any visible text is emitted.
+const MODEL = 'openai/gpt-oss-120b';
+const REASONING_EFFORT = 'low' as const;
+
+/**
+ * Tips get their own system prompt rather than reusing SYSTEM_PROMPT: that one
+ * is written for the chat turn and ends with "Never output JSON, code blocks,
+ * ... or raw tool arguments", which directly contradicts the tips request for a
+ * JSON array. gpt-oss-120b follows the conflict literally and answers "I'm
+ * sorry, but I can't provide that", which reaches the app as an empty tips
+ * list. The safety rules that matter here are restated below.
+ */
+const TIPS_SYSTEM_PROMPT = `You are a friendly wellness companion inside a medication reminder app. You generate short, general, non-clinical wellness tips.
+
+RULES:
+- Never name, suggest, or recommend any medication, supplement, or remedy — prescription or over-the-counter.
+- Never diagnose a condition, interpret a symptom, or interpret test results.
+- Never advise starting, stopping, or changing any treatment.
+- Stick to general self-care habits: hydration, sleep, gentle movement, nutrition, stress, routine, and taking doses on time.
+- If the user has a diagnosed condition, keep the tips gentle and generic; do not comment on the condition itself or on how to treat it.
+
+OUTPUT: return only a JSON array of strings and nothing else.`;
 
 /** How long generated wellness tips stay fresh before the next tab visit regenerates them. */
 const TIPS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
@@ -80,7 +107,7 @@ export interface PendingMedicationAction {
 }
 
 // Groq validates the model's generated arguments against this schema before
-// handing them back, and llama-3.3 habitually emits an explicit `null` for
+// handing them back, and the model habitually emits an explicit `null` for
 // every optional field it isn't using rather than omitting the key. A bare
 // `type: 'string'` therefore fails validation with `tool_use_failed`, so every
 // non-required field accepts null and the nulls are stripped in `stripNulls`.
@@ -370,12 +397,13 @@ export class AiService {
 
     const completion = await this.groq.chat.completions.create({
       model: MODEL,
+      reasoning_effort: REASONING_EFFORT,
       messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'system', content: TIPS_SYSTEM_PROMPT },
         { role: 'user', content: prompt },
       ],
       temperature: 0.7,
-      max_tokens: 300,
+      max_tokens: 400,
     });
 
     const usage = readUsage(completion);
@@ -477,6 +505,7 @@ export class AiService {
     try {
       const completion = await this.groq.chat.completions.create({
         model: MODEL,
+        reasoning_effort: REASONING_EFFORT,
         messages,
         ...(withTools
           ? {
@@ -486,7 +515,7 @@ export class AiService {
             }
           : {}),
         temperature: 0.6,
-        max_tokens: 300,
+        max_tokens: 500,
       });
       const { input, output } = readUsage(completion);
       usage.input += input;
@@ -624,9 +653,10 @@ export class AiService {
     try {
       const followUp = await this.groq.chat.completions.create({
         model: MODEL,
+        reasoning_effort: REASONING_EFFORT,
         messages: followUpMessages,
         temperature: 0.6,
-        max_tokens: 250,
+        max_tokens: 400,
       });
       const { input, output } = readUsage(followUp);
       usage.input += input;
@@ -651,7 +681,7 @@ export class AiService {
 
   /**
    * Drops keys the model set to an explicit `null`. The tool schema has to
-   * accept null (llama emits it for every unused optional field), but the
+   * accept null (models emit it for every unused optional field), but the
    * validators and DTO downstream expect those keys to simply be absent.
    */
   private stripNulls(args: Record<string, any>): Record<string, any> {
@@ -695,7 +725,7 @@ export class AiService {
   }
 
   /**
-   * llama-3.3 sometimes ignores the "plain prose" instruction and dumps the
+   * The model sometimes ignores the "plain prose" instruction and dumps the
    * tool arguments as a JSON blob (or an inline `<function=…>` call) into the
    * message body. The client renders replies as plain text, so scrub those
    * out rather than showing raw JSON in the chat bubble.
