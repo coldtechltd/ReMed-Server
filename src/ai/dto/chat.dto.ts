@@ -115,6 +115,15 @@ export class ChatDto {
   @IsArray()
   @ValidateNested({ each: true })
   @Type(() => ChatMessageDto)
+  /**
+   * @deprecated Ignored since the conversation moved server-side.
+   *
+   * Still accepted so an older build does not 400 against the strict
+   * ValidationPipe, but nothing reads it. It used to carry `pendingAction`,
+   * which meant a client could present a medication proposal the assistant
+   * had never made and get it created — the thread in `ai_messages` is now
+   * the only thing that can confirm what the server actually said.
+   */
   history?: ChatMessageDto[];
 
   // IANA timezone captured client-side (Intl.DateTimeFormat().resolvedOptions().timeZone),

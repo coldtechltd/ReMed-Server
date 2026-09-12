@@ -12,6 +12,7 @@ import { DosageFormModule } from './dosage-form/dosage-form.module';
 import { DoseEventModule } from './dose-event/dose-event.module';
 import { ScheduleModule } from '@nestjs/schedule';
 import { SentryModule } from '@sentry/nestjs/setup';
+import { MedicationNameModule } from './medication-name/medication-name.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { AiModule } from './ai/ai.module';
 import { LegalModule } from './legal/legal.module';
@@ -45,6 +46,7 @@ import { AuditInterceptor } from './common/interceptors/audit.interceptor';
     MedicationModule,
     DosageFormModule,
     DoseEventModule,
+    MedicationNameModule,
     NotificationsModule,
     AiModule,
     LegalModule,

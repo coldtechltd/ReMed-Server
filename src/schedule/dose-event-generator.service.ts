@@ -32,6 +32,8 @@ export interface ScheduleLike extends SchedulePayload {
   timezone?: string | null;
   isActive?: boolean | null;
   asNeeded?: boolean | null;
+  // cycleOnDays / cycleOffDays / cycleAnchorDate come in via SchedulePayload;
+  // the filtering itself lives in schedule.util so it stays pure and tested.
 }
 
 /**

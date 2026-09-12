@@ -8,11 +8,17 @@ import {
   Delete,
   UseGuards,
   Request,
+  Query,
 } from '@nestjs/common';
 import { DosageFormService } from './dosage-form.service';
 import { CreateDosageFormDto } from './dto/create-dosage-form.dto';
 import { UpdateDosageFormDto } from './dto/update-dosage-form.dto';
-import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
+import {
+  ApiTags,
+  ApiBearerAuth,
+  ApiOperation,
+  ApiQuery,
+} from '@nestjs/swagger';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 
 @ApiTags('dosage-form')
@@ -38,6 +44,17 @@ export class DosageFormController {
       medicationId,
       req.user.id,
     );
+  }
+
+  // Declared before @Get(':id') — Nest matches routes in declaration order,
+  // so the param route would otherwise swallow "as-needed" as an id.
+  @Get('as-needed')
+  @ApiOperation({
+    summary: "The user's as-needed (PRN) dosage forms with today's dose count",
+  })
+  @ApiQuery({ name: 'tz', required: false, description: 'IANA timezone' })
+  findAsNeeded(@Request() req, @Query('tz') tz?: string) {
+    return this.dosageFormService.findAsNeeded(req.user.id, tz);
   }
 
   @Get(':id')

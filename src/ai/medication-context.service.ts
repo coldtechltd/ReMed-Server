@@ -25,16 +25,27 @@ function describeSchedule(
   if (schedule.asNeeded || schedule.type === 'as_needed')
     return 'as needed (PRN)';
   if (schedule.type === 'interval') {
-    return `every ${schedule.intervalValue} ${schedule.intervalUnit}`;
+    return `every ${schedule.intervalValue} ${schedule.intervalUnit}${describeCycle(schedule)}`;
   }
   if (schedule.type === 'specific_times') {
     const times = schedule.specificTimes?.join(', ') ?? '';
     const days = schedule.daysOfWeek?.length
       ? ` on ${schedule.daysOfWeek.join(', ')}`
       : ' daily';
-    return `at ${times}${days}`;
+    return `at ${times}${days}${describeCycle(schedule)}`;
   }
   return schedule.type;
+}
+
+/** " (21 days on, 7 days off)" for a cyclic regimen, else "". */
+function describeCycle(
+  schedule: Pick<
+    typeof schema.schedules.$inferSelect,
+    'cycleOnDays' | 'cycleOffDays'
+  >,
+): string {
+  if (!schedule.cycleOnDays || !schedule.cycleOffDays) return '';
+  return ` (${schedule.cycleOnDays} days on, ${schedule.cycleOffDays} days off)`;
 }
 
 @Injectable()

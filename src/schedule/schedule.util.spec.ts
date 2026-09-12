@@ -1,8 +1,11 @@
 import {
+  assertValidScheduleTypeFields,
   computeDoseEventTimes,
   endOfDayInTz,
   startOfDayInTz,
+  hasCycle,
   horizonEndFor,
+  isWithinCyclePhase,
   MAX_EVENTS_PER_GENERATION,
   DEFAULT_HORIZON_DAYS,
 } from './schedule.util';
@@ -231,5 +234,251 @@ describe('dayKeyInTz', () => {
       .slice(0, 10);
     expect(dayKeyInTz(instant, 'Not/AZone')).toBe(local);
     expect(dayKeyInTz(instant)).toBe(local);
+  });
+});
+
+describe('cyclic regimens (B11)', () => {
+  // 21 days on, 7 off — a combined oral contraceptive, and the case this
+  // feature exists for.
+  const cycle = {
+    cycleOnDays: 21,
+    cycleOffDays: 7,
+    cycleAnchorDate: '2026-01-01T00:00:00Z',
+  };
+
+  describe('hasCycle', () => {
+    it('needs both halves to be a cycle', () => {
+      expect(hasCycle(cycle)).toBe(true);
+      expect(hasCycle({ cycleOnDays: 21, cycleOffDays: null })).toBe(false);
+      expect(hasCycle({ cycleOnDays: null, cycleOffDays: 7 })).toBe(false);
+      expect(hasCycle({})).toBe(false);
+      expect(hasCycle({ cycleOnDays: 0, cycleOffDays: 7 })).toBe(false);
+    });
+  });
+
+  describe('isWithinCyclePhase', () => {
+    const on = (iso: string) => isWithinCyclePhase(new Date(iso), cycle, 'UTC');
+
+    it('covers the whole on-phase, day 1 to day 21', () => {
+      expect(on('2026-01-01T09:00:00Z')).toBe(true); // day 0
+      expect(on('2026-01-15T09:00:00Z')).toBe(true); // day 14
+      expect(on('2026-01-21T09:00:00Z')).toBe(true); // day 20, last on day
+    });
+
+    it('suppresses the whole off-phase, day 22 to day 28', () => {
+      expect(on('2026-01-22T09:00:00Z')).toBe(false); // day 21, first off day
+      expect(on('2026-01-25T09:00:00Z')).toBe(false);
+      expect(on('2026-01-28T09:00:00Z')).toBe(false); // day 27, last off day
+    });
+
+    it('resumes on the next cycle', () => {
+      expect(on('2026-01-29T09:00:00Z')).toBe(true); // day 28 -> index 0
+      expect(on('2026-02-18T09:00:00Z')).toBe(true); // day 48 -> index 20
+      expect(on('2026-02-19T09:00:00Z')).toBe(false); // day 49 -> index 21
+    });
+
+    it('treats days before the anchor as outside the cycle', () => {
+      expect(on('2025-12-31T09:00:00Z')).toBe(false);
+    });
+
+    it('passes everything through when no cycle is defined', () => {
+      expect(isWithinCyclePhase(new Date('2026-06-01T09:00:00Z'), {})).toBe(
+        true,
+      );
+    });
+
+    it('does not suppress doses over a bad timezone or anchor', () => {
+      const d = new Date('2026-01-25T09:00:00Z'); // would be an off day
+      expect(isWithinCyclePhase(d, cycle, 'Not/AZone')).toBe(true);
+      expect(
+        isWithinCyclePhase(d, { ...cycle, cycleAnchorDate: 'not a date' }),
+      ).toBe(true);
+    });
+
+    it('counts calendar days, so DST cannot shift the phase', () => {
+      // Counting elapsed milliseconds instead would drift by an hour per
+      // transition and eventually flip a boundary day. US DST began
+      // 2026-03-08; day 0 is 2026-01-01 in New York.
+      const tz = 'America/New_York';
+      const dayIndexOf = (iso: string) => {
+        // 2026-03-12 is day 70 -> 70 % 28 = 14, inside the on-phase.
+        return isWithinCyclePhase(new Date(iso), cycle, tz);
+      };
+      expect(dayIndexOf('2026-03-12T17:00:00Z')).toBe(true); // day 70
+      // 2026-03-23 is day 81 -> 81 % 28 = 25, inside the off-phase.
+      expect(dayIndexOf('2026-03-23T17:00:00Z')).toBe(false);
+    });
+  });
+
+  describe('generation with a cycle', () => {
+    it('skips the off-week for specific_times schedules', () => {
+      const times = computeDoseEventTimes(
+        {
+          type: 'specific_times',
+          specificTimes: ['09:00'],
+          ...cycle,
+        },
+        'UTC',
+        {
+          start: new Date('2026-01-01T00:00:00Z'),
+          end: new Date('2026-01-28T23:59:59Z'),
+        },
+      );
+
+      // 21 on days in January starting the 1st; the 22nd-28th are off.
+      expect(times).toHaveLength(21);
+      expect(times[0].toISOString()).toBe('2026-01-01T09:00:00.000Z');
+      expect(times[20].toISOString()).toBe('2026-01-21T09:00:00.000Z');
+      const days = times.map((t) => t.toISOString().slice(0, 10));
+      expect(days).not.toContain('2026-01-22');
+      expect(days).not.toContain('2026-01-28');
+    });
+
+    it('composes with daysOfWeek rather than overriding it', () => {
+      const times = computeDoseEventTimes(
+        {
+          type: 'specific_times',
+          specificTimes: ['09:00'],
+          daysOfWeek: ['Mon'],
+          ...cycle,
+        },
+        'UTC',
+        {
+          start: new Date('2026-01-01T00:00:00Z'),
+          end: new Date('2026-01-31T23:59:59Z'),
+        },
+      );
+
+      // Mondays in Jan 2026: 5, 12, 19, 26. The 26th falls in the off-phase.
+      const days = times.map((t) => t.toISOString().slice(0, 10));
+      expect(days).toEqual(['2026-01-05', '2026-01-12', '2026-01-19']);
+    });
+
+    it('skips the off-phase for interval schedules too', () => {
+      const times = computeDoseEventTimes(
+        {
+          type: 'interval',
+          intervalValue: 1,
+          intervalUnit: 'days',
+          firstDoseAt: '2026-01-01T08:00:00Z',
+          ...cycle,
+        },
+        'UTC',
+        {
+          start: new Date('2026-01-01T00:00:00Z'),
+          end: new Date('2026-01-28T23:59:59Z'),
+        },
+      );
+      expect(times).toHaveLength(21);
+    });
+
+    it('keeps the interval grid anchored across an off-phase', () => {
+      // Every 2 days from Jan 1. Without filtering-in-place the grid would
+      // restart after the gap and land on the wrong parity.
+      const times = computeDoseEventTimes(
+        {
+          type: 'interval',
+          intervalValue: 2,
+          intervalUnit: 'days',
+          firstDoseAt: '2026-01-01T08:00:00Z',
+          cycleOnDays: 3,
+          cycleOffDays: 3,
+          cycleAnchorDate: '2026-01-01T00:00:00Z',
+        },
+        'UTC',
+        {
+          start: new Date('2026-01-01T00:00:00Z'),
+          end: new Date('2026-01-13T23:59:59Z'),
+        },
+      );
+      // Grid: 1,3,5,7,9,11,13. On-days are 1-3, 7-9, 13.
+      expect(times.map((t) => t.toISOString().slice(0, 10))).toEqual([
+        '2026-01-01',
+        '2026-01-03',
+        '2026-01-07',
+        '2026-01-09',
+        '2026-01-13',
+      ]);
+    });
+  });
+
+  describe('every-other-week intervals', () => {
+    it('steps by whole weeks', () => {
+      const times = computeDoseEventTimes(
+        {
+          type: 'interval',
+          intervalValue: 2,
+          intervalUnit: 'weeks',
+          firstDoseAt: '2026-01-05T08:00:00Z',
+        },
+        'UTC',
+        {
+          start: new Date('2026-01-01T00:00:00Z'),
+          end: new Date('2026-02-20T23:59:59Z'),
+        },
+      );
+      expect(times.map((t) => t.toISOString().slice(0, 10))).toEqual([
+        '2026-01-05',
+        '2026-01-19',
+        '2026-02-02',
+        '2026-02-16',
+      ]);
+    });
+
+    it('gets the default 90-day horizon, not the minute cap', () => {
+      const now = new Date('2026-01-01T00:00:00Z');
+      expect(
+        horizonEndFor(
+          { type: 'interval', intervalValue: 2, intervalUnit: 'weeks' },
+          now,
+        ).getTime(),
+      ).toBe(now.getTime() + DEFAULT_HORIZON_DAYS * DAY);
+    });
+  });
+
+  describe('assertValidScheduleTypeFields', () => {
+    it('rejects a half-specified cycle', () => {
+      expect(() =>
+        assertValidScheduleTypeFields({
+          type: 'specific_times',
+          specificTimes: ['09:00'],
+          cycleOnDays: 21,
+        }),
+      ).toThrow(/both cycleOnDays and cycleOffDays/);
+    });
+
+    it('rejects a zero-length phase', () => {
+      expect(() =>
+        assertValidScheduleTypeFields({
+          type: 'specific_times',
+          specificTimes: ['09:00'],
+          cycleOnDays: 21,
+          cycleOffDays: 0,
+        }),
+      ).toThrow(/must both be at least 1/);
+    });
+
+    it('rejects a cycle on a minute-grained interval', () => {
+      expect(() =>
+        assertValidScheduleTypeFields({
+          type: 'interval',
+          intervalValue: 30,
+          intervalUnit: 'minutes',
+          cycleOnDays: 21,
+          cycleOffDays: 7,
+        }),
+      ).toThrow(/minute-based intervals/);
+    });
+
+    it('accepts a well-formed cycle', () => {
+      expect(() =>
+        assertValidScheduleTypeFields({
+          type: 'specific_times',
+          specificTimes: ['09:00'],
+          cycleOnDays: 21,
+          cycleOffDays: 7,
+        }),
+      ).not.toThrow();
+    });
   });
 });

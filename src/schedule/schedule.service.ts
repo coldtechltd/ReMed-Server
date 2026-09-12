@@ -60,6 +60,13 @@ export class ScheduleService {
     // Validate type constraints
     assertValidScheduleTypeFields(createDto);
 
+    // A cycle with no anchor has nothing to count days from, and
+    // isWithinCyclePhase would pass everything through — silently turning a
+    // 21/7 regimen into "every day". Fall back to the medication's start.
+    const createBounds = await this.medicationBoundsForDosageForm(
+      createDto.dosageFormId,
+    );
+
     const [schedule] = await this.db
       .insert(schema.schedules)
       .values({
@@ -72,16 +79,22 @@ export class ScheduleService {
         firstDoseAt: createDto.firstDoseAt
           ? new Date(createDto.firstDoseAt)
           : null,
+        cycleOnDays: createDto.cycleOnDays ?? null,
+        cycleOffDays: createDto.cycleOffDays ?? null,
+        cycleAnchorDate: createDto.cycleOnDays
+          ? new Date(
+              createDto.cycleAnchorDate ??
+                createBounds.startDate ??
+                new Date(),
+            )
+          : null,
         timezone: createDto.timezone ?? 'UTC',
         asNeeded: createDto.asNeeded ?? false,
         isActive: createDto.isActive ?? true,
       })
       .returning();
 
-    const bounds = await this.medicationBoundsForDosageForm(
-      schedule.dosageFormId,
-    );
-    await this.doseEventGenerator.generateForSchedule(schedule, bounds);
+    await this.doseEventGenerator.generateForSchedule(schedule, createBounds);
 
     return schedule;
   }
@@ -129,26 +142,47 @@ export class ScheduleService {
   async update(id: string, userId: string, updateDto: UpdateScheduleDto) {
     const existing = await this.findOne(id, userId);
 
+    // Every field tests `!== undefined`, not truthiness. A truthy test can
+    // only ever set a value, never clear one — `cycleOnDays: null` to end a
+    // cyclic regimen, or an emptied daysOfWeek, would be silently dropped.
+    // (timezone was missing from this list entirely, so it could never be
+    // changed after creation.)
     const updateData: any = {};
-    if (updateDto.type) updateData.type = updateDto.type;
+    if (updateDto.type !== undefined) updateData.type = updateDto.type;
     if (updateDto.intervalValue !== undefined)
       updateData.intervalValue = updateDto.intervalValue;
-    if (updateDto.intervalUnit)
+    if (updateDto.intervalUnit !== undefined)
       updateData.intervalUnit = updateDto.intervalUnit;
-    if (updateDto.specificTimes)
+    if (updateDto.specificTimes !== undefined)
       updateData.specificTimes = updateDto.specificTimes;
-    if (updateDto.daysOfWeek) updateData.daysOfWeek = updateDto.daysOfWeek;
+    if (updateDto.daysOfWeek !== undefined)
+      updateData.daysOfWeek = updateDto.daysOfWeek;
     if (updateDto.firstDoseAt !== undefined) {
       updateData.firstDoseAt = updateDto.firstDoseAt
         ? new Date(updateDto.firstDoseAt)
         : null;
     }
+    if (updateDto.cycleOnDays !== undefined)
+      updateData.cycleOnDays = updateDto.cycleOnDays ?? null;
+    if (updateDto.cycleOffDays !== undefined)
+      updateData.cycleOffDays = updateDto.cycleOffDays ?? null;
+    if (updateDto.cycleAnchorDate !== undefined) {
+      updateData.cycleAnchorDate = updateDto.cycleAnchorDate
+        ? new Date(updateDto.cycleAnchorDate)
+        : null;
+    }
+    if (updateDto.timezone !== undefined)
+      updateData.timezone = updateDto.timezone;
     if (updateDto.asNeeded !== undefined)
       updateData.asNeeded = updateDto.asNeeded;
     if (updateDto.isActive !== undefined)
       updateData.isActive = updateDto.isActive;
 
     if (Object.keys(updateData).length === 0) return existing;
+
+    // Validate the *merged* shape: a PATCH that only sends cycleOffDays must
+    // still be checked against the cycleOnDays already on the row.
+    assertValidScheduleTypeFields({ ...existing, ...updateData });
 
     const [updated] = await this.db
       .update(schema.schedules)

@@ -20,6 +20,8 @@ import {
 import { UpdateMedicationDto } from './dto/update-medication.dto';
 import { CreateFullMedicationDto } from './dto/create-full-medication.dto';
 import { RestartMedicationDto } from './dto/restart-medication.dto';
+import { SetRemindersDto } from './dto/set-reminders.dto';
+import { CheckWarningsDto } from './dto/check-warnings.dto';
 import {
   ApiTags,
   ApiBearerAuth,
@@ -75,6 +77,27 @@ export class MedicationController {
     );
   }
 
+  @Post('check-warnings')
+  @ApiOperation({
+    summary:
+      'Advisory checks for a medication name: recorded allergies and duplicate therapy',
+  })
+  checkWarnings(@Request() req, @Body() dto: CheckWarningsDto) {
+    return this.medicationService
+      .checkWarnings(req.user.id, dto.names, dto.excludeMedicationId)
+      .then((warnings) => ({ warnings }));
+  }
+
+  // Before any @Get(':id') route — see the dosage-form controller for the
+  // same ordering constraint.
+  @Get('reminder-state')
+  @ApiOperation({
+    summary: 'Map of medication id -> whether its reminders are on',
+  })
+  reminderState(@Request() req) {
+    return this.medicationService.reminderState(req.user.id);
+  }
+
   @Get(':id')
   @ApiOperation({ summary: 'Get a specific medication by id' })
   findOne(@Request() req, @Param('id') id: string) {
@@ -101,6 +124,18 @@ export class MedicationController {
   })
   complete(@Request() req, @Param('id') id: string) {
     return this.medicationService.complete(id, req.user.id);
+  }
+
+  @Patch(':id/reminders')
+  @ApiOperation({
+    summary: 'Turn reminders on/off for every schedule under a medication',
+  })
+  setReminders(
+    @Request() req,
+    @Param('id') id: string,
+    @Body() dto: SetRemindersDto,
+  ) {
+    return this.medicationService.setReminders(id, req.user.id, dto.enabled);
   }
 
   @Patch(':id/restart')

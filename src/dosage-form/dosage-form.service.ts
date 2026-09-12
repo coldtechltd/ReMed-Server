@@ -5,12 +5,13 @@ import {
   ForbiddenException,
 } from '@nestjs/common';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { eq, inArray } from 'drizzle-orm';
+import { and, eq, gte, inArray, lte, or, sql } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { CreateDosageFormDto } from './dto/create-dosage-form.dto';
 import { UpdateDosageFormDto } from './dto/update-dosage-form.dto';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
 import { MedicationService } from '../medication/medication.service';
+import { endOfDayInTz, startOfDayInTz } from '../schedule/schedule.util';
 
 @Injectable()
 export class DosageFormService {
@@ -39,6 +40,102 @@ export class DosageFormService {
       .returning();
 
     return form;
+  }
+
+  /**
+   * The user's PRN ("as needed") dosage forms, with how many doses they've
+   * already logged today.
+   *
+   * PRN schedules materialize no dose events, so these medications are
+   * invisible to every dose-event read path — without this the home screen
+   * simply cannot show them, and the only way to log one is to navigate to
+   * its dosage-form detail screen.
+   *
+   * Not filtered on `schedules.isActive`: that flag is the *reminder* toggle,
+   * and PRN doses never generate reminders, so honouring it here would hide a
+   * usable medication for a reason that doesn't apply to it.
+   */
+  async findAsNeeded(userId: string, tz?: string) {
+    const zone = tz || 'UTC';
+    const now = new Date();
+    let dayStart: Date;
+    let dayEnd: Date;
+    try {
+      dayStart = startOfDayInTz(now, zone);
+      dayEnd = endOfDayInTz(now, zone);
+    } catch {
+      // Invalid IANA zone — degrade to server-local rather than 500ing, the
+      // same way every other day-bounded read in this codebase does.
+      dayStart = new Date(now);
+      dayStart.setHours(0, 0, 0, 0);
+      dayEnd = new Date(now);
+      dayEnd.setHours(23, 59, 59, 999);
+    }
+
+    const rows = await this.db
+      .select({
+        id: schema.dosageForms.id,
+        name: schema.dosageForms.name,
+        type: schema.dosageForms.type,
+        dosageAmount: schema.dosageForms.dosageAmount,
+        dosageUnit: schema.dosageForms.dosageUnit,
+        quantityOnHand: schema.dosageForms.quantityOnHand,
+        refillThreshold: schema.dosageForms.refillThreshold,
+        medicationId: schema.medications.id,
+        medicationName: schema.medications.name,
+      })
+      .from(schema.dosageForms)
+      .innerJoin(
+        schema.medications,
+        eq(schema.dosageForms.medicationId, schema.medications.id),
+      )
+      .innerJoin(
+        schema.schedules,
+        eq(schema.schedules.dosageFormId, schema.dosageForms.id),
+      )
+      .where(
+        and(
+          eq(schema.medications.userId, userId),
+          eq(schema.medications.status, 'active'),
+          or(
+            eq(schema.schedules.type, 'as_needed'),
+            eq(schema.schedules.asNeeded, true),
+          ),
+        ),
+      )
+      .groupBy(schema.dosageForms.id, schema.medications.id);
+
+    if (rows.length === 0) return [];
+
+    // One grouped count for every form, rather than a query per form.
+    const counts = await this.db
+      .select({
+        dosageFormId: schema.schedules.dosageFormId,
+        takenToday: sql<number>`count(*)::int`,
+      })
+      .from(schema.doseEvents)
+      .innerJoin(
+        schema.schedules,
+        eq(schema.doseEvents.scheduleId, schema.schedules.id),
+      )
+      .where(
+        and(
+          inArray(
+            schema.schedules.dosageFormId,
+            rows.map((r) => r.id),
+          ),
+          eq(schema.doseEvents.status, 'taken'),
+          gte(schema.doseEvents.takenAt, dayStart),
+          lte(schema.doseEvents.takenAt, dayEnd),
+        ),
+      )
+      .groupBy(schema.schedules.dosageFormId);
+
+    const countByForm = new Map(
+      counts.map((c) => [c.dosageFormId, c.takenToday]),
+    );
+
+    return rows.map((r) => ({ ...r, takenToday: countByForm.get(r.id) ?? 0 }));
   }
 
   async findAllByMedication(

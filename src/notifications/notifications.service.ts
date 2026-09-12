@@ -17,6 +17,8 @@ import { Expo, ExpoPushMessage, ExpoPushTicket } from 'expo-server-sdk';
 import * as schema from '../db/schema';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
 import { CronLockService } from '../common/cron-lock/cron-lock.service';
+import { UpdateNotificationPreferencesDto } from './dto/notification-preference.dto';
+import { isWithinQuietHours } from './quiet-hours.util';
 import {
   projectStock,
   daysUntil,
@@ -35,6 +37,12 @@ const RECEIPT_CHECK_DELAY_MS = 5 * 60 * 1000;
 const RECEIPT_GIVE_UP_MS = 60 * 60 * 1000;
 // Guard against unbounded growth if the receipt API is down for a long stretch.
 const MAX_PENDING_RECEIPTS = 5000;
+/**
+ * How long delivery rows are kept. Long enough to answer "why didn't I get my
+ * reminder last week?" and to compute a monthly delivery rate; short enough
+ * that the table doesn't grow without bound at users x doses-per-day.
+ */
+const DELIVERY_LOG_RETENTION_DAYS = 30;
 
 // A dose marked missed more than a day ago is history, not news — alerting a
 // companion about it then is noise, and it also bounds this query's scan.
@@ -46,6 +54,27 @@ interface PendingReceipt {
   pushToken: string;
   queuedAt: number;
 }
+
+/** Push categories the delivery log distinguishes. */
+type DeliveryCategory =
+  | 'dose_reminder'
+  | 'refill_reminder'
+  | 'companion_missed_dose'
+  | 'companion_refill';
+
+/**
+ * Per-message attribution for the delivery log, index-aligned with the
+ * ExpoPushMessage[] handed to sendPush.
+ */
+interface DeliveryContext {
+  userId: string;
+  category: DeliveryCategory;
+  /** Dose event id, or dosage form id for refills. */
+  refId?: string | null;
+}
+
+type NewDeliveryRow = typeof schema.notificationDeliveries.$inferInsert;
+type PreferenceRow = typeof schema.notificationPreferences.$inferSelect;
 
 @Injectable()
 export class NotificationsService {
@@ -61,6 +90,91 @@ export class NotificationsService {
     private readonly cronLock: CronLockService,
   ) {
     this.expo = new Expo();
+  }
+
+  /**
+   * What a user gets before they ever open the settings screen. Mirrors the
+   * column defaults; kept here too so reads don't have to create a row.
+   */
+  static readonly DEFAULT_PREFERENCES = {
+    doseRemindersEnabled: true,
+    refillRemindersEnabled: true,
+    companionAlertsEnabled: true,
+    quietHoursEnabled: false,
+    quietHoursStart: '22:00',
+    quietHoursEnd: '07:00',
+    defaultSnoozeMinutes: 15,
+    timezone: null as string | null,
+  };
+
+  async getPreferences(userId: string) {
+    const [row] = await this.db
+      .select()
+      .from(schema.notificationPreferences)
+      .where(eq(schema.notificationPreferences.userId, userId));
+
+    return row ?? { userId, ...NotificationsService.DEFAULT_PREFERENCES };
+  }
+
+  async updatePreferences(
+    userId: string,
+    dto: UpdateNotificationPreferencesDto,
+  ) {
+    // Upsert: the row is created on first save rather than at signup, so
+    // users who never touch these settings cost nothing.
+    const [row] = await this.db
+      .insert(schema.notificationPreferences)
+      .values({ ...NotificationsService.DEFAULT_PREFERENCES, ...dto, userId })
+      .onConflictDoUpdate({
+        target: schema.notificationPreferences.userId,
+        set: { ...dto, updatedAt: new Date() },
+      })
+      .returning();
+
+    return row;
+  }
+
+  /**
+   * Preferences for many users at once, keyed by user id.
+   *
+   * The crons decide who to notify in one pass, so they need this as a lookup
+   * rather than a query per recipient. Users with no row are absent from the
+   * map and callers fall back to DEFAULT_PREFERENCES.
+   */
+  private async preferencesFor(userIds: string[]) {
+    if (userIds.length === 0) return new Map<string, PreferenceRow>();
+    const rows = await this.db
+      .select()
+      .from(schema.notificationPreferences)
+      .where(inArray(schema.notificationPreferences.userId, userIds));
+    return new Map(rows.map((r) => [r.userId, r]));
+  }
+
+  /**
+   * Should we send an ambient (non-dose) notification to this user right now?
+   *
+   * `channel` picks which opt-out applies. `respectQuietHours` must only be
+   * true for a caller that will genuinely retry later, because skipping is a
+   * *deferral* — and a deferral that never comes back around is just silent
+   * data loss. The hourly companion cron retries within the hour; the daily
+   * refill cron fires once at a fixed UTC time, so for a user whose local
+   * clock puts that instant inside their quiet window, skipping would drop the
+   * reminder every single day forever. Refills therefore honour the opt-out
+   * toggle but not quiet hours.
+   */
+  private ambientAllowed(
+    prefs: PreferenceRow | undefined,
+    channel: 'refill' | 'companion',
+    now: Date,
+    { respectQuietHours }: { respectQuietHours: boolean },
+  ): boolean {
+    const p = prefs ?? NotificationsService.DEFAULT_PREFERENCES;
+    const enabled =
+      channel === 'refill'
+        ? p.refillRemindersEnabled
+        : p.companionAlertsEnabled;
+    if (!enabled) return false;
+    return respectQuietHours ? !isWithinQuietHours(now, p) : true;
   }
 
   @Cron(CronExpression.EVERY_MINUTE)
@@ -127,8 +241,24 @@ export class NotificationsService {
 
       const messages: ExpoPushMessage[] = [];
       const eventIdPerMessage: string[] = [];
+      const contexts: DeliveryContext[] = [];
+
+      // The server-side half of the app's master Reminders switch. Quiet hours
+      // are deliberately NOT consulted here — a dose scheduled for 03:00 has to
+      // alert at 03:00, and a silently dropped reminder is indistinguishable
+      // from one that never fired. See quiet-hours.util.
+      const prefsByUser = await this.preferencesFor([
+        ...new Set(pendingDoses.map((d) => d.medication.userId)),
+      ]);
 
       for (const dose of pendingDoses) {
+        if (
+          prefsByUser.get(dose.medication.userId)?.doseRemindersEnabled ===
+          false
+        ) {
+          continue;
+        }
+
         const pushToken = dose.device.expoPushToken;
         if (!Expo.isExpoPushToken(pushToken)) {
           this.logger.error(
@@ -154,6 +284,11 @@ export class NotificationsService {
         });
 
         eventIdPerMessage.push(dose.event.id);
+        contexts.push({
+          userId: dose.medication.userId,
+          category: 'dose_reminder',
+          refId: dose.event.id,
+        });
       }
 
       if (messages.length === 0) return;
@@ -162,7 +297,7 @@ export class NotificationsService {
       // index-aligned with messages / eventIdPerMessage. A dose can appear
       // once per device, so dedupe before updating — one delivered ticket is
       // enough to mark the event as reminded.
-      const results = await this.sendPush(messages);
+      const results = await this.sendPush(messages, contexts);
       const sentEventIds = [
         ...new Set(eventIdPerMessage.filter((_, i) => results[i])),
       ];
@@ -215,7 +350,8 @@ export class NotificationsService {
       )
         return;
 
-      const since = new Date(Date.now() - COMPANION_MISSED_LOOKBACK_MS);
+      const now = new Date();
+      const since = new Date(now.getTime() - COMPANION_MISSED_LOOKBACK_MS);
 
       const missed = await this.db
         .select({
@@ -351,8 +487,27 @@ export class NotificationsService {
 
       const messages: ExpoPushMessage[] = [];
       const eventIdsPerMessage: string[][] = [];
+      const contexts: DeliveryContext[] = [];
+
+      // Ambient channel: honours both the companion's own opt-out and their
+      // quiet hours. A missed-dose alert that waits until morning is fine; a
+      // missed dose *reminder* would not be.
+      const alertPrefs = await this.preferencesFor([
+        ...new Set([...groups.values()].map((g) => g.companionId)),
+      ]);
 
       for (const group of groups.values()) {
+        if (
+          !this.ambientAllowed(
+            alertPrefs.get(group.companionId),
+            'companion',
+            now,
+            { respectQuietHours: true },
+          )
+        ) {
+          continue;
+        }
+
         const { title, body } = companionMissedDoseCopy(
           nameByOwner.get(group.ownerId),
           group.items,
@@ -381,12 +536,19 @@ export class NotificationsService {
             channelId: 'companion',
           });
           eventIdsPerMessage.push(group.eventIds);
+          // Logged against the companion who receives it, not the owner whose
+          // dose it was — "why didn't I get an alert?" is asked by the reader.
+          contexts.push({
+            userId: group.companionId,
+            category: 'companion_missed_dose',
+            refId: group.eventIds[0] ?? null,
+          });
         }
       }
 
       if (messages.length === 0) return;
 
-      const results = await this.sendPush(messages);
+      const results = await this.sendPush(messages, contexts);
       const sentEventIds = [
         ...new Set(
           eventIdsPerMessage.flatMap((ids, i) => (results[i] ? ids : [])),
@@ -625,6 +787,17 @@ export class NotificationsService {
 
       const messages: ExpoPushMessage[] = [];
       const formIdPerMessage: string[] = [];
+      const contexts: DeliveryContext[] = [];
+
+      // Both refill legs are ambient: each recipient's own opt-out and quiet
+      // hours apply. Owners and companions are looked up together so this is
+      // one query regardless of how many people are involved.
+      const refillPrefs = await this.preferencesFor([
+        ...new Set([
+          ...dueForms.map((d) => d.medication.userId),
+          ...[...companionsByOwner.values()].flat(),
+        ]),
+      ]);
 
       for (const { form, medication } of dueForms) {
         const events = eventsByForm.get(form.id) ?? [];
@@ -654,6 +827,17 @@ export class NotificationsService {
             continue;
           }
 
+          if (
+            !this.ambientAllowed(
+              refillPrefs.get(medication.userId),
+              'refill',
+              now,
+              { respectQuietHours: false },
+            )
+          ) {
+            continue;
+          }
+
           messages.push({
             to: pushToken,
             sound: 'default',
@@ -672,6 +856,11 @@ export class NotificationsService {
             channelId: 'refill',
           });
           formIdPerMessage.push(form.id);
+          contexts.push({
+            userId: medication.userId,
+            category: 'refill_reminder',
+            refId: form.id,
+          });
         }
 
         // Same shortfall, phrased about the owner rather than to them. Private
@@ -685,6 +874,17 @@ export class NotificationsService {
 
           for (const companionId of companionsByOwner.get(medication.userId) ??
             []) {
+            if (
+              !this.ambientAllowed(
+                refillPrefs.get(companionId),
+                'companion',
+                now,
+                { respectQuietHours: false },
+              )
+            ) {
+              continue;
+            }
+
             for (const device of devicesByUser.get(companionId) ?? []) {
               const pushToken = device.expoPushToken;
               if (!Expo.isExpoPushToken(pushToken)) continue;
@@ -704,6 +904,11 @@ export class NotificationsService {
               // Shares the owner's refillReminderSentAt latch: both are sent in
               // the same run, so one throttle covers everyone.
               formIdPerMessage.push(form.id);
+              contexts.push({
+                userId: companionId,
+                category: 'companion_refill',
+                refId: form.id,
+              });
             }
           }
         }
@@ -711,7 +916,7 @@ export class NotificationsService {
 
       if (messages.length === 0) return;
 
-      const results = await this.sendPush(messages);
+      const results = await this.sendPush(messages, contexts);
       const sentFormIds = [
         ...new Set(formIdPerMessage.filter((_, i) => results[i])),
       ];
@@ -740,26 +945,102 @@ export class NotificationsService {
     }
   }
 
+  /**
+   * Trim the delivery log.
+   *
+   * Without this the table grows forever at roughly (users x doses per day)
+   * rows, and it is pure diagnostics — nothing downstream reads rows this old.
+   */
+  @Cron(CronExpression.EVERY_DAY_AT_4AM)
+  @SentryCron('prune-delivery-log', {
+    schedule: { type: 'crontab', value: '0 4 * * *' },
+    checkinMargin: 60,
+    maxRuntime: 10,
+    timezone: 'UTC',
+  })
+  async handleDeliveryLogRetention() {
+    try {
+      if (!(await this.cronLock.claim('delivery-log-retention', 86_400_000)))
+        return;
+
+      const cutoff = new Date(
+        Date.now() - DELIVERY_LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000,
+      );
+      const deleted = await this.db
+        .delete(schema.notificationDeliveries)
+        .where(lt(schema.notificationDeliveries.sentAt, cutoff))
+        .returning({ id: schema.notificationDeliveries.id });
+
+      if (deleted.length > 0) {
+        this.logger.log(
+          `Pruned ${deleted.length} notification delivery row(s) older than ${DELIVERY_LOG_RETENTION_DAYS} days.`,
+        );
+      }
+    } catch (error: any) {
+      const code = error?.cause?.code;
+      if (code === 'ETIMEDOUT' || code === 'ENOTFOUND' || code === 'XX000') {
+        this.logger.warn(
+          `Database unavailable during delivery-log prune (${code}). Retrying tomorrow.`,
+        );
+      } else {
+        this.logger.error(
+          `Database error during delivery-log prune: ${error.message || error}`,
+        );
+      }
+    }
+  }
+
   // Shared Expo send: chunks messages, sends them, and returns a boolean[]
   // index-aligned with the input indicating which messages were accepted.
   //
   // "Accepted" is not "delivered" — see handlePushReceipts below.
-  private async sendPush(messages: ExpoPushMessage[]): Promise<boolean[]> {
+  //
+  // `contexts` is index-aligned with `messages` and exists purely so the
+  // delivery log can attribute a ticket to a user and a dose/form. This is the
+  // only place a ticket id, its push token and its accept/reject outcome are
+  // all in scope, so it's the only place the row can be opened.
+  private async sendPush(
+    messages: ExpoPushMessage[],
+    contexts: DeliveryContext[] = [],
+  ): Promise<boolean[]> {
     const results: boolean[] = new Array(messages.length).fill(false);
     const chunks = this.expo.chunkPushNotifications(messages);
+    const rows: NewDeliveryRow[] = [];
     let offset = 0;
 
     for (const chunk of chunks) {
       try {
         const ticketChunk = await this.expo.sendPushNotificationsAsync(chunk);
         ticketChunk.forEach((ticket: ExpoPushTicket, i) => {
+          const ctx = contexts[offset + i];
           if (ticket.status === 'ok') {
             results[offset + i] = true;
             this.queueReceipt(ticket.id, chunk[i].to as string);
+            if (ctx) {
+              rows.push({
+                userId: ctx.userId,
+                category: ctx.category,
+                refId: ctx.refId ?? null,
+                pushToken: chunk[i].to as string,
+                ticketId: ticket.id,
+                status: 'accepted',
+              });
+            }
           } else {
             this.logger.error(
               `Push ticket error: ${ticket.message} (${ticket.details?.error ?? 'no detail'})`,
             );
+            if (ctx) {
+              rows.push({
+                userId: ctx.userId,
+                category: ctx.category,
+                refId: ctx.refId ?? null,
+                pushToken: chunk[i].to as string,
+                ticketId: null,
+                status: 'rejected',
+                errorCode: ticket.details?.error ?? 'unknown',
+              });
+            }
           }
         });
       } catch (error) {
@@ -768,7 +1049,64 @@ export class NotificationsService {
       offset += chunk.length;
     }
 
+    await this.recordDeliveries(rows);
+
     return results;
+  }
+
+  /**
+   * Write the receipt's verdict back onto the rows sendPush opened.
+   *
+   * Also swallows its own errors — see recordDeliveries. Tickets with no
+   * matching row (sent before this table existed, or by another replica that
+   * logged them itself) simply match nothing, which is correct.
+   */
+  private async resolveDeliveries(
+    delivered: string[],
+    failed: Map<string, string>,
+  ) {
+    const resolvedAt = new Date();
+    try {
+      if (delivered.length > 0) {
+        await this.db
+          .update(schema.notificationDeliveries)
+          .set({ status: 'delivered', resolvedAt })
+          .where(inArray(schema.notificationDeliveries.ticketId, delivered));
+      }
+      // Grouped by error code so each distinct failure is one statement
+      // rather than one per ticket.
+      const ticketsByError = new Map<string, string[]>();
+      for (const [ticketId, code] of failed) {
+        const list = ticketsByError.get(code) ?? [];
+        list.push(ticketId);
+        ticketsByError.set(code, list);
+      }
+      for (const [code, ticketIds] of ticketsByError) {
+        await this.db
+          .update(schema.notificationDeliveries)
+          .set({ status: 'failed', errorCode: code, resolvedAt })
+          .where(inArray(schema.notificationDeliveries.ticketId, ticketIds));
+      }
+    } catch (error) {
+      this.logger.warn('Failed to resolve notification delivery rows', error);
+    }
+  }
+
+  /**
+   * Persist delivery rows. Swallows its own errors on purpose: this is
+   * diagnostics, and a logging failure must never take down the reminder that
+   * was actually delivered — same principle as EntitlementService.recordUsage.
+   */
+  private async recordDeliveries(rows: NewDeliveryRow[]) {
+    if (rows.length === 0) return;
+    try {
+      await this.db.insert(schema.notificationDeliveries).values(rows);
+    } catch (error) {
+      this.logger.warn(
+        `Failed to record ${rows.length} notification delivery row(s)`,
+        error,
+      );
+    }
   }
 
   private queueReceipt(ticketId: string, pushToken: string) {
@@ -815,6 +1153,9 @@ export class NotificationsService {
     const tokenByTicket = new Map(due.map((r) => [r.ticketId, r.pushToken]));
     const stillPending: PendingReceipt[] = [];
     const deadTokens = new Set<string>();
+    // Terminal outcomes to write back to the delivery log, keyed by ticket.
+    const deliveredTickets: string[] = [];
+    const failedTickets = new Map<string, string>();
 
     for (const idChunk of this.expo.chunkPushNotificationReceiptIds(
       due.map((r) => r.ticketId),
@@ -843,9 +1184,13 @@ export class NotificationsService {
           continue;
         }
 
-        if (receipt.status === 'ok') continue;
+        if (receipt.status === 'ok') {
+          deliveredTickets.push(ticketId);
+          continue;
+        }
 
         const detail = receipt.details?.error;
+        failedTickets.set(ticketId, detail ?? 'unknown');
         this.logger.error(
           `Push delivery failed (${detail ?? 'unknown'}): ${receipt.message}`,
         );
@@ -858,6 +1203,8 @@ export class NotificationsService {
     }
 
     this.pendingReceipts.push(...stillPending);
+
+    await this.resolveDeliveries(deliveredTickets, failedTickets);
 
     // The app re-registers on next launch, so clearing is safe: it costs at
     // most one missed reminder on a device that already wasn't receiving them.

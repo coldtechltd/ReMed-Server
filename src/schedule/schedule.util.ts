@@ -9,10 +9,22 @@ import { BadRequestException } from '@nestjs/common';
 export interface SchedulePayload {
   type: string;
   intervalValue?: number | null;
+  /** 'minutes' | 'hours' | 'days' | 'weeks' */
   intervalUnit?: string | null;
   specificTimes?: string[] | null;
   daysOfWeek?: string[] | null;
   firstDoseAt?: string | Date | null;
+  /**
+   * Cyclic regimens: N days on, M days off, repeating — the shape of
+   * combined oral contraceptives (21/7), some chemo protocols, and
+   * "one week on, one week off" courses. Applies on top of whatever the
+   * schedule's own type generates, so a cycle composes with both
+   * specific_times and interval, and with daysOfWeek.
+   */
+  cycleOnDays?: number | null;
+  cycleOffDays?: number | null;
+  /** Day 1 of the first "on" phase. Falls back to the medication start. */
+  cycleAnchorDate?: string | Date | null;
 }
 
 /** Inclusive [start, end] range of instants to materialize events for. */
@@ -129,6 +141,68 @@ export function horizonEndFor(
   return new Date(now.getTime() + DEFAULT_HORIZON_DAYS * DAY_MS);
 }
 
+/** The cycle fields, as an independently testable shape. */
+export interface CyclePhase {
+  cycleOnDays?: number | null;
+  cycleOffDays?: number | null;
+  cycleAnchorDate?: string | Date | null;
+}
+
+/** Does this schedule actually define a cycle? */
+export function hasCycle(cycle: CyclePhase): boolean {
+  return Boolean(
+    cycle.cycleOnDays &&
+      cycle.cycleOffDays &&
+      cycle.cycleOnDays > 0 &&
+      cycle.cycleOffDays > 0,
+  );
+}
+
+/**
+ * Is `instant` inside an "on" phase of a cyclic regimen?
+ *
+ * The day index is counted in **calendar days in the schedule's timezone**, not
+ * by dividing elapsed milliseconds. That distinction is the whole point: a DST
+ * transition makes one local day 23 or 25 hours long, so millisecond division
+ * would drift the phase by a day twice a year — and for a 21-on/7-off
+ * contraceptive that means a pill reminder on the wrong day.
+ *
+ * Days before the anchor are outside the cycle: a regimen cannot have started
+ * before its own first day.
+ *
+ * Returns true when no cycle is defined, so callers can apply it unconditionally.
+ */
+export function isWithinCyclePhase(
+  instant: Date,
+  cycle: CyclePhase,
+  timeZone = 'UTC',
+): boolean {
+  if (!hasCycle(cycle)) return true;
+
+  const anchorRaw = cycle.cycleAnchorDate;
+  if (!anchorRaw) return true;
+  const anchor = new Date(anchorRaw);
+  if (Number.isNaN(anchor.getTime())) return true;
+
+  const tz = timeZone || 'UTC';
+  let dayIndex: number;
+  try {
+    const anchorDay = startOfDayInTz(anchor, tz).getTime();
+    const instantDay = startOfDayInTz(instant, tz).getTime();
+    // Both are local midnights, so the gap is a whole number of days up to
+    // the DST hour; rounding absorbs that without letting the index slip.
+    dayIndex = Math.round((instantDay - anchorDay) / DAY_MS);
+  } catch {
+    // Invalid zone — don't silently suppress doses over a bad tz string.
+    return true;
+  }
+
+  if (dayIndex < 0) return false;
+
+  const period = (cycle.cycleOnDays ?? 0) + (cycle.cycleOffDays ?? 0);
+  return dayIndex % period < (cycle.cycleOnDays ?? 0);
+}
+
 /**
  * Compute the dose-event instants for a schedule inside `window`, expressed
  * in absolute UTC. Returns a de-duplicated, capped list. Does not touch the
@@ -169,7 +243,11 @@ export function computeDoseEventTimes(
       if (dayStart > end) break;
 
       const abbrev = weekdayAbbrev(dayInstant, tz);
-      if (!payload.daysOfWeek?.length || payload.daysOfWeek.includes(abbrev)) {
+      const inCycle = isWithinCyclePhase(dayStart, payload, tz);
+      if (
+        inCycle &&
+        (!payload.daysOfWeek?.length || payload.daysOfWeek.includes(abbrev))
+      ) {
         for (const timeStr of payload.specificTimes) {
           const [hours, minutes] = timeStr.split(':').map(Number);
           const instant = zonedTimeToUtc(
@@ -203,6 +281,8 @@ export function computeDoseEventTimes(
       msInterval = payload.intervalValue * 60 * 1000;
     else if (payload.intervalUnit === 'days')
       msInterval = payload.intervalValue * DAY_MS;
+    else if (payload.intervalUnit === 'weeks')
+      msInterval = payload.intervalValue * 7 * DAY_MS;
 
     if (msInterval > 0) {
       // Fast-forward a past first dose onto the grid at/after the window start,
@@ -214,7 +294,12 @@ export function computeDoseEventTimes(
         current = new Date(current.getTime() + count * msInterval);
       }
       while (current <= end && eventTimes.length < MAX_EVENTS_PER_GENERATION) {
-        eventTimes.push(new Date(current));
+        // Filter rather than skip-ahead: the interval grid stays anchored to
+        // firstDoseAt, so doses resume on their original clock times when the
+        // next "on" phase starts instead of drifting by the off-phase length.
+        if (isWithinCyclePhase(current, payload, tz)) {
+          eventTimes.push(new Date(current));
+        }
         current = new Date(current.getTime() + msInterval);
       }
     }
@@ -244,6 +329,8 @@ export function assertValidScheduleTypeFields(sch: {
   intervalValue?: number | null;
   intervalUnit?: string | null;
   specificTimes?: string[] | null;
+  cycleOnDays?: number | null;
+  cycleOffDays?: number | null;
 }): void {
   if (sch.type === 'interval' && (!sch.intervalValue || !sch.intervalUnit)) {
     throw new BadRequestException(
@@ -254,5 +341,30 @@ export function assertValidScheduleTypeFields(sch: {
     throw new BadRequestException(
       'Specific times schedule requires specificTimes array',
     );
+  }
+
+  // A half-specified cycle is the dangerous case: "21 on" with no off-phase
+  // would silently generate every day forever, which is exactly the regimen
+  // the user was trying to avoid. Reject rather than guess.
+  const onDays = sch.cycleOnDays ?? null;
+  const offDays = sch.cycleOffDays ?? null;
+  if ((onDays === null) !== (offDays === null)) {
+    throw new BadRequestException(
+      'A cycle needs both cycleOnDays and cycleOffDays',
+    );
+  }
+  if (onDays !== null && offDays !== null) {
+    if (onDays < 1 || offDays < 1) {
+      throw new BadRequestException(
+        'cycleOnDays and cycleOffDays must both be at least 1',
+      );
+    }
+    // Cycles are counted in whole days, so a sub-day interval can't express
+    // one — and a minute-grained schedule only materializes 48h ahead anyway.
+    if (sch.type === 'interval' && sch.intervalUnit === 'minutes') {
+      throw new BadRequestException(
+        'Cycles cannot be combined with minute-based intervals',
+      );
+    }
   }
 }

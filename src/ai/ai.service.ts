@@ -1,7 +1,7 @@
-import { Injectable, Inject } from '@nestjs/common';
+import { Injectable, Inject, Logger } from '@nestjs/common';
 import Groq from 'groq-sdk';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { eq } from 'drizzle-orm';
+import { desc, eq } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
 import { ProfileService } from '../profile/profile.service';
@@ -9,11 +9,13 @@ import { MedicationService } from '../medication/medication.service';
 import { MedicationContextService } from './medication-context.service';
 import {
   assertValidScheduleTypeFields,
+  dayKeyInTz,
   localDateParts,
 } from '../schedule/schedule.util';
 import { CreateFullMedicationDto } from '../medication/dto/create-full-medication.dto';
 import { CreateMedicationArgsDto } from './dto/chat.dto';
 import { EntitlementService } from '../billing/entitlement.service';
+import { DoseEventService } from '../dose-event/dose-event.service';
 
 export interface TokenUsage {
   input: number;
@@ -50,6 +52,7 @@ WHAT YOU CAN ALWAYS DO — these are the core purpose of this app, do them witho
 - Do supply/quantity planning, including for travel. If the user asks something like "what do I need to pack for a trip from the 3rd to the 17th", work it out from their saved medications: for each one, count the doses over that date range from its schedule, compare against the quantity on hand, and tell them how many units to bring and whether they need a refill first. Only ever use the medications and numbers given to you in context — never invent a drug, a quantity, or a date.
 - Give general, non-drug self-care guidance for common, mild symptoms — rest, ice/heat, compression, elevation, hydration, positioning, gentle movement, sleep — informed by any already-diagnosed condition in the user's profile (e.g. hemophilia + joint pain → RICE, avoid straining the joint, seek care if swelling worsens). Add a brief note to see a doctor for anything beyond simple self-care.
 - Suggest general wellness habits, offer encouragement and emotional support, and remind the user to take their doses on time.
+- Log doses the user tells you about, and report their own adherence back to them. Recording that someone took a dose is bookkeeping, exactly like recording a medication — it is not a judgement about whether they should have.
 
 WHEN TO ESCALATE:
 Redirect to a doctor or emergency services only when the user is DESCRIBING A SYMPTOM OR HOW THEY FEEL and it sounds severe or sudden — chest pain, difficulty breathing, heavy or uncontrolled bleeding, high fever, confusion, or anything they frame as an emergency. Then reply: "This could be serious — please contact your doctor or emergency services right away." Do NOT use this response for scheduling, reminder, stock, refill, packing, or general questions — those are never emergencies, no matter which drug is named.
@@ -61,7 +64,13 @@ ADDING A MEDICATION REMINDER:
 - Gather: medication name, dosage amount/unit, form (tablet, liquid, injection, etc.), a full schedule (interval, specific times, or as-needed), and a start date. Ask short follow-up questions for whatever is missing — one or two at a time, not a form.
 - Once you have enough details, call propose_medication. This does NOT create anything; the app shows the user a review card built from your arguments. Your own message should just be one short sentence asking them to confirm — do not restate the fields.
 - Only call create_medication on a LATER turn, after the user has explicitly confirmed (e.g. "yes", "go ahead", "confirm") the proposal from your immediately preceding message. Never call create_medication in the same turn as propose_medication, and never without a clear confirmation.
-- If the user asks to change something before confirming, call propose_medication again with the corrected details.`;
+- If the user asks to change something before confirming, call propose_medication again with the corrected details.
+
+LOGGING OR REVIEWING DOSES:
+- To answer anything about today's doses, or to act on one, call get_todays_doses first. You cannot know a dose's id any other way — never guess one.
+- For "how am I doing?", "what did I miss this week?", or anything about streaks and adherence, call get_adherence_summary and report the numbers plainly.
+- To mark a dose taken or missed, or to snooze one, call propose_dose_action, then say in one short sentence what you are about to do and ask them to confirm. Only call confirm_dose_action on a LATER turn after they explicitly agree.
+- Be careful about intent: "I need to take my pill" is not "I took my pill", and "should I take it now?" is a question, not a confirmation. When it is ambiguous, ask before proposing anything. A dose record the user did not mean to create is worse than an extra question.`;
 
 // Groq decommissioned `llama-3.3-70b-versatile` — requests for it now come
 // back 404 `model_not_found`, which surfaced in the app as "Couldn't load
@@ -93,18 +102,49 @@ RULES:
 OUTPUT: return only a JSON array of strings and nothing else.`;
 
 /** How long generated wellness tips stay fresh before the next tab visit regenerates them. */
+/**
+ * How much of the thread the model sees. Ten turns was the previous
+ * client-side slice; keeping it means the same conversational memory and the
+ * same token cost, now with the server as the source of truth.
+ */
+const HISTORY_LIMIT = 10;
+/** How much the client can pull back to render. */
+const HISTORY_PAGE_LIMIT = 50;
+
 const TIPS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
-  pendingAction?: PendingMedicationAction;
+  pendingAction?: PendingAction;
 }
 
 export interface PendingMedicationAction {
   tool: 'create_medication';
   args: CreateMedicationArgsDto;
 }
+
+export interface DoseActionArgs {
+  doseEventId: string;
+  action: 'taken' | 'missed' | 'snooze';
+  snoozeMinutes?: number | null;
+  /** Human-readable label, so the client can render the card without a lookup. */
+  label?: string;
+}
+
+export interface PendingDoseAction {
+  tool: 'dose_action';
+  args: DoseActionArgs;
+}
+
+/**
+ * Anything the assistant has proposed and is waiting on confirmation for.
+ *
+ * Every write the assistant can make goes through this shape: propose on one
+ * turn, execute on a later one against the *stored* args. The model never gets
+ * to supply the arguments at execution time.
+ */
+export type PendingAction = PendingMedicationAction | PendingDoseAction;
 
 // Groq validates the model's generated arguments against this schema before
 // handing them back, and the model habitually emits an explicit `null` for
@@ -238,6 +278,118 @@ const MEDICATION_TOOLS: Groq.Chat.ChatCompletionTool[] = [
 ];
 
 /**
+ * Read-only tools. These execute immediately — there is nothing to confirm
+ * about answering a question, and requiring a round trip to read your own
+ * adherence would make the assistant useless for it.
+ */
+const DOSE_READ_TOOLS: Groq.Chat.ChatCompletionTool[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'get_todays_doses',
+      description:
+        "List the user's doses for today with their ids and status. Call this before any tool that acts on a specific dose — you cannot know a dose id otherwise.",
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_adherence_summary',
+      description:
+        'Get the user\'s adherence statistics — how many doses they took or missed, their current streak — over a recent window. Use this to answer questions like "how did I do this week?" or "what did I miss?".',
+      parameters: {
+        type: 'object',
+        properties: {
+          days: {
+            type: 'integer',
+            description: 'How many days back to summarize. Defaults to 7.',
+          },
+        },
+        required: [],
+      },
+    },
+  },
+];
+
+/**
+ * Write tools, which follow exactly the same two-step confirm as
+ * create_medication: propose, let the user see what will happen, act on a
+ * later turn against server-stored arguments. Marking a dose taken is a
+ * medical record the user relies on — the model must not be able to write one
+ * because it misread "I should take my pill" as "I took my pill".
+ */
+const DOSE_WRITE_TOOLS: Groq.Chat.ChatCompletionTool[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'propose_dose_action',
+      description:
+        'Propose marking a dose as taken or missed, or snoozing it. This does NOT change anything — it shows the user what you intend to do so they can confirm. Get the dose id from get_todays_doses first.',
+      parameters: {
+        type: 'object',
+        properties: {
+          doseEventId: {
+            type: 'string',
+            description: 'The dose id from get_todays_doses.',
+          },
+          action: {
+            type: 'string',
+            enum: ['taken', 'missed', 'snooze'],
+            description: 'What to do with the dose.',
+          },
+          snoozeMinutes: {
+            type: ['integer', 'null'],
+            description: 'For action "snooze": how many minutes, 1-180.',
+          },
+        },
+        required: ['doseEventId', 'action'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'confirm_dose_action',
+      description:
+        'Carry out the dose action you proposed in your previous message, after the user has explicitly confirmed it. Takes no details — the app holds the exact proposal the user agreed to.',
+      parameters: {
+        type: 'object',
+        properties: {
+          confirmed: {
+            type: 'boolean',
+            description: 'Set true when the user explicitly agreed.',
+          },
+        },
+        required: ['confirmed'],
+      },
+    },
+  },
+];
+
+/**
+ * Does this turn look like it is about logging or reviewing doses?
+ *
+ * Tool schemas cost roughly a thousand input tokens, and they are sent on
+ * every turn they are attached to — so they are attached only when they could
+ * plausibly be used, the same way needsMedicationTools works. Erring generous:
+ * a false negative means the assistant unhelpfully claims it cannot do
+ * something it can.
+ */
+const DOSE_INTENT =
+  /\b(took|taken|take[ns]?|had|swallowed|missed|miss|skip(?:ped)?|forgot|snooze|remind me later|log|logged|mark|adheren\w*|streak|how (?:did|am|have) i|this week|last week|today'?s doses|my doses|due)\b/i;
+
+function needsDoseTools(message: string, history: ChatMessage[]): boolean {
+  if (DOSE_INTENT.test(message)) return true;
+  // A bare "yes" confirming a proposed dose action needs the tools attached
+  // on this turn too, or there is nothing to confirm with.
+  const last = history[history.length - 1];
+  return Boolean(
+    last?.role === 'assistant' && last.pendingAction?.tool === 'dose_action',
+  );
+}
+
+/**
  * Whether this turn could plausibly involve setting up a medication reminder.
  * The tool schemas are ~1k input tokens sent on every request, so they're
  * attached only when they might actually be used.
@@ -312,6 +464,7 @@ function extractFailedGeneration(err: unknown): string | undefined {
 
 @Injectable()
 export class AiService {
+  private readonly logger = new Logger(AiService.name);
   private groq: Groq;
 
   constructor(
@@ -319,6 +472,7 @@ export class AiService {
     private readonly medicationService: MedicationService,
     private readonly medicationContextService: MedicationContextService,
     private readonly entitlements: EntitlementService,
+    private readonly doseEventService: DoseEventService,
     @Inject(DRIZZLE_CLIENT)
     private readonly db: NodePgDatabase<typeof schema>,
   ) {
@@ -424,19 +578,270 @@ export class AiService {
     message: string,
     history: ChatMessage[] = [],
     timezone = 'UTC',
-  ): Promise<{ reply: string; pendingAction?: PendingMedicationAction }> {
+  ): Promise<{ reply: string; pendingAction?: PendingAction }> {
     // Before any work: the context build below runs four DB queries, so a
     // caller who is out of allowance should be turned away ahead of them.
     await this.entitlements.assertQuota(userId, 'chat');
     const usage: TokenUsage = { input: 0, output: 0 };
 
+    // The server's own record of the conversation, not the client's.
+    //
+    // `history` from the request is ignored for anything that matters. It used
+    // to carry the pending medication proposal, which meant a crafted request
+    // could present a proposal the assistant never made and have
+    // create_medication execute against it. The stored thread is the only
+    // thing that can confirm what the server actually said.
+    const storedHistory = await this.loadHistory(userId);
+
     try {
-      return await this.runChat(userId, message, history, timezone, usage);
+      const result = await this.runChat(
+        userId,
+        message,
+        storedHistory,
+        timezone,
+        usage,
+      );
+
+      await this.persistTurn(userId, message, result);
+      return result;
     } finally {
       // In `finally` so every exit path is metered — including the ones that
       // bail out after a provider error, which still cost us input tokens.
       await this.entitlements.recordUsage(userId, 'chat', usage);
     }
+  }
+
+  /** The stored thread, oldest first, capped at what the model will see. */
+  private async loadHistory(userId: string): Promise<ChatMessage[]> {
+    const rows = await this.db
+      .select()
+      .from(schema.aiMessages)
+      .where(eq(schema.aiMessages.userId, userId))
+      .orderBy(desc(schema.aiMessages.createdAt))
+      .limit(HISTORY_LIMIT);
+
+    return rows.reverse().map((row) => ({
+      role: row.role as 'user' | 'assistant',
+      content: row.content,
+      pendingAction: (row.pendingAction as PendingAction | null) ?? undefined,
+    }));
+  }
+
+  /**
+   * Append the user's message and the assistant's reply.
+   *
+   * Errors are swallowed: losing a line of transcript is a far smaller failure
+   * than throwing away a reply the user already paid quota for.
+   */
+  private async persistTurn(
+    userId: string,
+    message: string,
+    result: { reply: string; pendingAction?: PendingAction },
+  ) {
+    try {
+      await this.db.insert(schema.aiMessages).values([
+        { userId, role: 'user', content: message },
+        {
+          userId,
+          role: 'assistant',
+          content: result.reply,
+          pendingAction: result.pendingAction ?? null,
+        },
+      ]);
+    } catch (error) {
+      this.logger.warn('Failed to persist AI chat turn', error);
+    }
+  }
+
+  /**
+   * Today's doses, with the ids every dose action depends on.
+   *
+   * Deliberately compact: the model only needs enough to name a dose back to
+   * the user and pick the right id, and every field here costs tokens in the
+   * follow-up completion.
+   */
+  private async readTodaysDoses(
+    userId: string,
+    timezone: string,
+  ): Promise<ToolResult> {
+    try {
+      const events = await this.doseEventService.findEventsByDate(
+        userId,
+        this.todayString(timezone),
+        timezone,
+      );
+
+      if (events.length === 0) {
+        return { status: 'ok', message: 'No doses scheduled for today.' };
+      }
+
+      const doses = events.map((e: any) => ({
+        id: e.id,
+        medication: e.medication?.name,
+        time: new Date(e.scheduledFor).toLocaleTimeString('en-GB', {
+          timeZone: timezone,
+          hour: '2-digit',
+          minute: '2-digit',
+        }),
+        status: e.status,
+      }));
+
+      return { status: 'ok', message: JSON.stringify(doses) };
+    } catch (err) {
+      return {
+        status: 'error',
+        message:
+          err instanceof Error ? err.message : "Couldn't read today's doses.",
+      };
+    }
+  }
+
+  /** Adherence over a recent window, for "how did I do this week?". */
+  private async readAdherence(
+    userId: string,
+    args: Record<string, unknown>,
+    timezone: string,
+  ): Promise<ToolResult> {
+    try {
+      const requested = Number(args.days);
+      const days = Number.isFinite(requested)
+        ? Math.min(Math.max(Math.trunc(requested), 1), 90)
+        : 7;
+
+      const to = new Date();
+      const from = new Date(to.getTime() - (days - 1) * 24 * 60 * 60 * 1000);
+      const stats = await this.doseEventService.getStats(
+        userId,
+        dayKeyInTz(from, timezone),
+        dayKeyInTz(to, timezone),
+        timezone,
+      );
+
+      return {
+        status: 'ok',
+        message: JSON.stringify({
+          days,
+          taken: stats.totals.taken,
+          missed: stats.totals.missed,
+          pending: stats.totals.pending,
+          adherenceRate: stats.adherenceRate,
+          currentStreak: stats.currentStreak,
+        }),
+      };
+    } catch (err) {
+      return {
+        status: 'error',
+        message:
+          err instanceof Error ? err.message : "Couldn't read adherence stats.",
+      };
+    }
+  }
+
+  /**
+   * Validate a proposed dose action and turn it into a pending action.
+   *
+   * Ownership is checked here, at proposal time, so the user is never shown a
+   * confirmation card for a dose that isn't theirs — `findOne` throws on a
+   * cross-tenant id.
+   */
+  private async buildDoseProposal(
+    userId: string,
+    args: Record<string, unknown>,
+  ): Promise<{ pendingAction?: PendingDoseAction; error?: string }> {
+    const doseEventId = String(args.doseEventId ?? '');
+    const action = String(args.action ?? '');
+
+    if (!doseEventId) {
+      return { error: 'No dose id given. Call get_todays_doses first.' };
+    }
+    if (action !== 'taken' && action !== 'missed' && action !== 'snooze') {
+      return { error: 'action must be "taken", "missed" or "snooze".' };
+    }
+
+    let snoozeMinutes: number | null = null;
+    if (action === 'snooze') {
+      const raw = Number(args.snoozeMinutes);
+      snoozeMinutes = Number.isFinite(raw)
+        ? Math.min(Math.max(Math.trunc(raw), 1), 180)
+        : 15;
+    }
+
+    try {
+      const event: any = await this.doseEventService.findOne(
+        doseEventId,
+        userId,
+      );
+      return {
+        pendingAction: {
+          tool: 'dose_action',
+          args: {
+            doseEventId,
+            action,
+            snoozeMinutes,
+            label: event.medication?.name ?? 'this dose',
+          },
+        },
+      };
+    } catch {
+      return {
+        error:
+          "That dose doesn't exist or isn't yours. Call get_todays_doses and use an id from the result.",
+      };
+    }
+  }
+
+  /** Carry out a confirmed dose action against the stored arguments. */
+  private async applyDoseAction(
+    userId: string,
+    args: DoseActionArgs,
+  ): Promise<ToolResult> {
+    try {
+      await this.doseEventService.update(
+        args.doseEventId,
+        userId,
+        args.action === 'snooze'
+          ? { snoozeMinutes: args.snoozeMinutes ?? 15 }
+          : { status: args.action },
+      );
+
+      return {
+        status: 'ok',
+        message:
+          args.action === 'snooze'
+            ? `Snoozed for ${args.snoozeMinutes ?? 15} minutes.`
+            : `Dose marked ${args.action}.`,
+      };
+    } catch (err) {
+      return {
+        status: 'error',
+        message:
+          err instanceof Error ? err.message : "Couldn't update that dose.",
+      };
+    }
+  }
+
+  /** The stored conversation, for the client to render on mount. */
+  async getHistory(userId: string, limit = HISTORY_PAGE_LIMIT) {
+    const rows = await this.db
+      .select({
+        role: schema.aiMessages.role,
+        content: schema.aiMessages.content,
+        pendingAction: schema.aiMessages.pendingAction,
+        createdAt: schema.aiMessages.createdAt,
+      })
+      .from(schema.aiMessages)
+      .where(eq(schema.aiMessages.userId, userId))
+      .orderBy(desc(schema.aiMessages.createdAt))
+      .limit(Math.min(limit, HISTORY_PAGE_LIMIT));
+
+    return rows.reverse();
+  }
+
+  async clearHistory(userId: string) {
+    await this.db
+      .delete(schema.aiMessages)
+      .where(eq(schema.aiMessages.userId, userId));
+    return { cleared: true };
   }
 
   private async runChat(
@@ -445,7 +850,7 @@ export class AiService {
     history: ChatMessage[],
     timezone: string,
     usage: TokenUsage,
-  ): Promise<{ reply: string; pendingAction?: PendingMedicationAction }> {
+  ): Promise<{ reply: string; pendingAction?: PendingAction }> {
     // Build context prefix from profile (once, as system injection)
     let profileContext = '';
     try {
@@ -456,6 +861,17 @@ export class AiService {
       if (profile.height) parts.push(`height ${profile.height} cm`);
       if (profile.weight) parts.push(`weight ${profile.weight} kg`);
       if (parts.length) profileContext = `The user is ${parts.join(', ')}.`;
+      // Allergies are added so the assistant can point out that a medication
+      // the user is recording matches something on their own profile. That is
+      // reading their record back to them, not an interaction check — the
+      // "never advise on interactions or safety" rule in SYSTEM_PROMPT is
+      // unchanged and still governs what it may say about it.
+      if (profile.allergies) {
+        profileContext +=
+          `${profileContext ? ' ' : ''}The user has recorded these allergies: ` +
+          `${profile.allergies}. If a medication they mention matches one, say so plainly ` +
+          `and suggest they confirm with their pharmacist or doctor — never judge whether it is safe.`;
+      }
     } catch {
       // ignore
     }
@@ -496,20 +912,27 @@ export class AiService {
     let choice: Groq.Chat.ChatCompletionMessage | undefined;
     let toolCall: Groq.Chat.ChatCompletionMessageToolCall | undefined;
 
-    const withTools = needsMedicationTools(
+    // Each tool set costs roughly a thousand input tokens on every turn it is
+    // attached to, so they're gated independently rather than sent together.
+    const withMedicationTools = needsMedicationTools(
       message,
       history,
-      Boolean(priorPendingAction),
+      priorPendingAction?.tool === 'create_medication',
     );
+    const withDoseTools = needsDoseTools(message, history);
+    const tools = [
+      ...(withMedicationTools ? MEDICATION_TOOLS : []),
+      ...(withDoseTools ? [...DOSE_READ_TOOLS, ...DOSE_WRITE_TOOLS] : []),
+    ];
 
     try {
       const completion = await this.groq.chat.completions.create({
         model: MODEL,
         reasoning_effort: REASONING_EFFORT,
         messages,
-        ...(withTools
+        ...(tools.length
           ? {
-              tools: MEDICATION_TOOLS,
+              tools,
               tool_choice: 'auto' as const,
               parallel_tool_calls: false,
             }
@@ -556,7 +979,7 @@ export class AiService {
     }
 
     let toolResult: ToolResult;
-    let pendingAction: PendingMedicationAction | undefined;
+    let pendingAction: PendingAction | undefined;
 
     if (toolCall.function.name === 'propose_medication') {
       try {
@@ -583,7 +1006,7 @@ export class AiService {
         };
       }
     } else if (toolCall.function.name === 'create_medication') {
-      if (!priorPendingAction) {
+      if (priorPendingAction?.tool !== 'create_medication') {
         toolResult = {
           status: 'error',
           message:
@@ -618,6 +1041,39 @@ export class AiService {
                 : 'Failed to create the medication.',
           };
         }
+      }
+    } else if (toolCall.function.name === 'get_todays_doses') {
+      // Read-only, so it runs immediately. The ids it returns are what any
+      // subsequent dose action refers to — the model can't invent a UUID.
+      toolResult = await this.readTodaysDoses(userId, timezone);
+    } else if (toolCall.function.name === 'get_adherence_summary') {
+      toolResult = await this.readAdherence(userId, args, timezone);
+    } else if (toolCall.function.name === 'propose_dose_action') {
+      const proposal = await this.buildDoseProposal(userId, args);
+      if (proposal.error) {
+        toolResult = { status: 'error', message: proposal.error };
+      } else {
+        pendingAction = proposal.pendingAction;
+        toolResult = {
+          status: 'ok',
+          message:
+            'Proposal captured. Summarize it for the user and ask them to confirm — do not call confirm_dose_action in this same turn.',
+        };
+      }
+    } else if (toolCall.function.name === 'confirm_dose_action') {
+      if (priorPendingAction?.tool !== 'dose_action') {
+        toolResult = {
+          status: 'error',
+          message:
+            'There is no dose action awaiting confirmation. Call get_todays_doses and propose_dose_action first.',
+        };
+      } else {
+        // Same rule as create_medication: execute the stored args, never the
+        // ones the model re-emits at confirmation time.
+        toolResult = await this.applyDoseAction(
+          userId,
+          priorPendingAction.args,
+        );
       }
     } else {
       toolResult = { status: 'error', message: 'Unknown tool.' };

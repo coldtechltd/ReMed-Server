@@ -30,6 +30,14 @@ export const schedules = pgTable(
     // IANA timezone (e.g. "Africa/Lagos") the specific_times are expressed in,
     // captured from the user's device. Used to compute correct UTC dose instants.
     timezone: varchar('timezone', { length: 64 }).default('UTC'),
+    // Cyclic regimens: N days on, M days off (21/7 contraceptives, chemo
+    // protocols, "a week on, a week off"). Applied on top of whatever the
+    // schedule type generates, so it composes with specificTimes, interval
+    // and daysOfWeek alike. Both halves are required or neither.
+    cycleOnDays: integer('cycle_on_days'),
+    cycleOffDays: integer('cycle_off_days'),
+    /** Day 1 of the first on-phase; defaults to the medication's start date. */
+    cycleAnchorDate: timestamp('cycle_anchor_date'),
     asNeeded: boolean('as_needed').default(false),
     isActive: boolean('is_active').default(true),
     createdAt: timestamp('created_at').defaultNow(),

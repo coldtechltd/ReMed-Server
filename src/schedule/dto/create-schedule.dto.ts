@@ -8,6 +8,7 @@ import {
   IsArray,
   IsDateString,
   IsIn,
+  Min,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
@@ -35,7 +36,8 @@ export class CreateScheduleDto {
   intervalValue?: number;
 
   @ApiPropertyOptional({
-    description: 'For interval type, units e.g. minutes, hours, days',
+    description:
+      'For interval type: minutes, hours, days or weeks (weeks gives every-other-week dosing).',
   })
   @IsOptional()
   @IsString()
@@ -69,6 +71,33 @@ export class CreateScheduleDto {
   @IsOptional()
   @IsString()
   timezone?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Cyclic regimen: days in the "on" phase (e.g. 21 for a 21/7 contraceptive). Requires cycleOffDays.',
+    minimum: 1,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  cycleOnDays?: number;
+
+  @ApiPropertyOptional({
+    description: 'Cyclic regimen: days in the "off" phase. Requires cycleOnDays.',
+    minimum: 1,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  cycleOffDays?: number;
+
+  @ApiPropertyOptional({
+    description:
+      'Day 1 of the first on-phase. Defaults to the medication start date.',
+  })
+  @IsOptional()
+  @IsDateString()
+  cycleAnchorDate?: string;
 
   @ApiPropertyOptional({ description: 'Is PRN (as needed)?' })
   @IsOptional()

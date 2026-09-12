@@ -48,6 +48,22 @@ export class DoseEventService {
     OR ${schema.doseEvents.scheduledFor} <= coalesce(${schema.medications.completedAt}, ${schema.doseEvents.scheduledFor})
   )`;
 
+  /**
+   * Excludes PRN ("as needed") doses from adherence aggregation.
+   *
+   * A logged PRN dose is a real `taken` row, but it was never *scheduled* — so
+   * counting it inflates the adherence rate and the streak, and taking an extra
+   * painkiller would make adherence look better than it is. Adherence is only
+   * meaningful against doses the user was actually supposed to take.
+   *
+   * `as_needed` is recorded two ways (the `type` and the `asNeeded` flag) and
+   * `asNeeded` is nullable on rows written by older builds, hence the coalesce.
+   */
+  private readonly scheduledOnly = sql`(
+    ${schema.schedules.type} <> 'as_needed'
+    AND coalesce(${schema.schedules.asNeeded}, false) = false
+  )`;
+
   async findAllByUser(userId: string) {
     // This requires joining doseEvents -> schedules -> dosageForms -> medications
     // Drizzle query API doesn't support deep nested mapping easily without custom manual mapping,
@@ -303,6 +319,7 @@ export class DoseEventService {
           gte(schema.doseEvents.scheduledFor, from),
           lte(schema.doseEvents.scheduledFor, to),
           this.notStoppedBefore,
+          this.scheduledOnly,
           ...this.privacyFilter(opts),
         ),
       );
@@ -558,7 +575,24 @@ export class DoseEventService {
     if (updateDto.status) {
       updateData.status = updateDto.status;
       if (updateDto.status === 'taken') {
-        updateData.takenAt = new Date();
+        // A dose can be logged late or early ("taken at 9:30, not 9:00"), so
+        // takenAt is the user's stated time when given. The same small future
+        // tolerance as logDose covers clock skew between device and server
+        // without letting the user log a dose they haven't taken yet.
+        let takenAt = new Date();
+        if (updateDto.takenAt) {
+          takenAt = new Date(updateDto.takenAt);
+          if (takenAt.getTime() > Date.now() + 5 * 60_000) {
+            throw new BadRequestException(
+              'takenAt cannot be in the future — you can only log a dose you have already taken',
+            );
+          }
+        }
+        updateData.takenAt = takenAt;
+      } else {
+        // Correcting away from "taken" (undo a mis-tap, or flag it missed
+        // after all) must not leave a stale takenAt behind.
+        updateData.takenAt = null;
       }
     }
     if (updateDto.reminderSent !== undefined) {
@@ -573,18 +607,29 @@ export class DoseEventService {
       .where(eq(schema.doseEvents.id, id))
       .returning();
 
-    // Decrement stock only on a real transition into "taken" (avoid
-    // double-counting if the dose was already taken), and only for forms that
-    // actually track stock. Floor at 0 so we never go negative.
-    if (
-      updateDto.status === 'taken' &&
-      existing.status !== 'taken' &&
-      existing.dosageForm.quantityOnHand !== null
-    ) {
+    // Keep stock in step with the *transition*, not the target state, and only
+    // for forms that actually track stock.
+    //
+    // Both directions matter now that a logged dose can be corrected: entering
+    // "taken" spends a dose, leaving it gives that dose back. Guarding on the
+    // transition (rather than on the new status alone) is what stops a repeated
+    // "taken" from double-decrementing. Floor at 0 so we never go negative.
+    const tracksStock = existing.dosageForm.quantityOnHand !== null;
+    const wasTaken = existing.status === 'taken';
+    const isTaken = updateData.status === 'taken';
+
+    if (tracksStock && !wasTaken && isTaken) {
       await this.db
         .update(schema.dosageForms)
         .set({
           quantityOnHand: sql`GREATEST(${schema.dosageForms.quantityOnHand} - ${existing.dosageForm.dosageAmount}, 0)`,
+        })
+        .where(eq(schema.dosageForms.id, existing.dosageForm.id));
+    } else if (tracksStock && wasTaken && updateDto.status && !isTaken) {
+      await this.db
+        .update(schema.dosageForms)
+        .set({
+          quantityOnHand: sql`${schema.dosageForms.quantityOnHand} + ${existing.dosageForm.dosageAmount}`,
         })
         .where(eq(schema.dosageForms.id, existing.dosageForm.id));
     }

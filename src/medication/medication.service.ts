@@ -21,7 +21,15 @@ import { RestartMedicationDto } from './dto/restart-medication.dto';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
 import { CronLockService } from '../common/cron-lock/cron-lock.service';
 import { DoseEventGeneratorService } from '../schedule/dose-event-generator.service';
-import { endOfDayInTz } from '../schedule/schedule.util';
+import {
+  assertValidScheduleTypeFields,
+  endOfDayInTz,
+} from '../schedule/schedule.util';
+import { MedicationNameService } from '../medication-name/medication-name.service';
+import {
+  findMedicationWarnings,
+  type MedicationWarning,
+} from './medication-warnings.util';
 
 /**
  * Resolves the medication type and end date together, since they constrain each
@@ -51,6 +59,7 @@ export class MedicationService {
     private readonly db: NodePgDatabase<typeof schema>,
     private readonly doseEventGenerator: DoseEventGeneratorService,
     private readonly cronLock: CronLockService,
+    private readonly medicationNameService: MedicationNameService,
   ) {}
 
   /**
@@ -59,9 +68,18 @@ export class MedicationService {
    * nothing is, so a mid-way failure can't leave an orphaned half-medication.
    */
   async createFull(userId: string, dto: CreateFullMedicationDto) {
+    // Computed *before* the insert, so "already taking this" compares against
+    // what existed beforehand rather than against the row we are about to add.
+    // Advisory only — a recorded allergy never blocks a create, because the
+    // field is free text and the user may be knowingly working around it.
+    const warnings = await this.checkWarnings(userId, [
+      dto.name,
+      ...dto.dosageForms.map((f) => f.name),
+    ]);
+
     const { type, endDate } = resolveTypeAndEndDate(dto);
 
-    return this.db.transaction(async (tx) => {
+    const created = await this.db.transaction(async (tx) => {
       const [medication] = await tx
         .insert(schema.medications)
         .values({
@@ -91,6 +109,12 @@ export class MedicationService {
           .returning();
 
         for (const sch of df.schedules) {
+          // The atomic create path never ran these cross-field checks, so a
+          // half-specified cycle from the wizard would have generated every
+          // day forever instead of being rejected. The DTO validates each
+          // field in isolation; only this catches the combinations.
+          assertValidScheduleTypeFields(sch);
+
           const tz = sch.timezone ?? 'UTC';
           const [schedule] = await tx
             .insert(schema.schedules)
@@ -102,6 +126,14 @@ export class MedicationService {
               specificTimes: sch.specificTimes,
               daysOfWeek: sch.daysOfWeek,
               firstDoseAt: sch.firstDoseAt ? new Date(sch.firstDoseAt) : null,
+              cycleOnDays: sch.cycleOnDays ?? null,
+              cycleOffDays: sch.cycleOffDays ?? null,
+              // A cycle with no explicit anchor starts with the medication —
+              // otherwise isWithinCyclePhase has nothing to count from and the
+              // regimen would silently degrade to "every day".
+              cycleAnchorDate: sch.cycleOnDays
+                ? new Date(sch.cycleAnchorDate ?? medication.startDate)
+                : null,
               timezone: tz,
               asNeeded: sch.asNeeded ?? false,
               isActive: sch.isActive ?? true,
@@ -122,6 +154,8 @@ export class MedicationService {
 
       return medication;
     });
+
+    return { ...created, warnings };
   }
 
   async create(userId: string, createMedicationDto: CreateMedicationDto) {
@@ -337,6 +371,144 @@ export class MedicationService {
   /**
    * Put a completed medication back into rotation and refill its dose-event horizon.
    */
+  /**
+   * Advisory warnings for a medication the user is about to add: does its name
+   * match an allergy on their profile, or a medication they already take?
+   *
+   * Returns warnings; it never throws. A recorded allergy can be a typo, an
+   * old childhood note, or something a prescriber has knowingly worked around
+   * — the user decides, we only surface what they already told us.
+   */
+  async checkWarnings(
+    userId: string,
+    names: string | readonly string[],
+    excludeMedicationId?: string,
+  ): Promise<MedicationWarning[]> {
+    const candidates = [...new Set(
+      (Array.isArray(names) ? names : [names as string])
+        .map((n) => n?.trim())
+        .filter((n): n is string => Boolean(n)),
+    )];
+    if (candidates.length === 0) return [];
+
+    const [profile] = await this.db
+      .select({ allergies: schema.profiles.allergies })
+      .from(schema.profiles)
+      .where(eq(schema.profiles.userId, userId));
+
+    const existing = await this.db
+      .select({ id: schema.medications.id, name: schema.medications.name })
+      .from(schema.medications)
+      .where(
+        and(
+          eq(schema.medications.userId, userId),
+          eq(schema.medications.status, 'active'),
+        ),
+      );
+
+    // Resolve active ingredients so a brand and its generic compare equal.
+    // Unknown names simply resolve to null and fall back to name matching.
+    const activeMedications = await Promise.all(
+      existing
+        .filter((m) => m.id !== excludeMedicationId)
+        .map(async (m) => ({
+          ...m,
+          genericName: await this.medicationNameService.resolveGeneric(m.name),
+        })),
+    );
+
+    const warnings: MedicationWarning[] = [];
+    for (const candidate of candidates) {
+      const genericName =
+        await this.medicationNameService.resolveGeneric(candidate);
+      warnings.push(
+        ...findMedicationWarnings({
+          name: candidate,
+          genericName,
+          allergies: profile?.allergies ?? null,
+          activeMedications,
+        }),
+      );
+    }
+
+    // A treatment named after its only drug would otherwise report the same
+    // allergy twice.
+    const seen = new Set<string>();
+    return warnings.filter((w) => {
+      const key = `${w.kind}:${w.matched}:${w.medicationId ?? ''}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  /**
+   * Whether reminders are on for each of the user's medications, keyed by id.
+   *
+   * A medication can own several dosage forms and so several schedules, so
+   * "reminders on" means *any* schedule under it is active — which is exactly
+   * what `setReminders` toggles. Returned as a map so the settings list can
+   * render N switches from one request instead of fetching schedules per
+   * medication.
+   */
+  async reminderState(userId: string): Promise<Record<string, boolean>> {
+    const rows = await this.db
+      .select({
+        medicationId: schema.medications.id,
+        isActive: schema.schedules.isActive,
+      })
+      .from(schema.medications)
+      .leftJoin(
+        schema.dosageForms,
+        eq(schema.dosageForms.medicationId, schema.medications.id),
+      )
+      .leftJoin(
+        schema.schedules,
+        eq(schema.schedules.dosageFormId, schema.dosageForms.id),
+      )
+      .where(eq(schema.medications.userId, userId));
+
+    const state: Record<string, boolean> = {};
+    for (const row of rows) {
+      state[row.medicationId] = (state[row.medicationId] ?? false) ||
+        row.isActive === true;
+    }
+    return state;
+  }
+
+  /**
+   * Flip reminders for every schedule under a medication in one call.
+   *
+   * `schedules.isActive` is already the per-schedule reminder switch (the
+   * dosage-form screen toggles it individually), but a medication with several
+   * dosage forms has several schedules, and muting it from a settings list
+   * shouldn't mean N round trips and N cache invalidations.
+   *
+   * Note this is the *reminder* switch, not the lifecycle one — turning it off
+   * stops pushes but keeps generating dose events, so the medication still
+   * appears on the home screen and still counts towards adherence. Stopping a
+   * medication entirely is `complete()`.
+   */
+  async setReminders(id: string, userId: string, enabled: boolean) {
+    await this.findOne(id, userId);
+
+    const updated = await this.db
+      .update(schema.schedules)
+      .set({ isActive: enabled })
+      .where(
+        inArray(
+          schema.schedules.dosageFormId,
+          this.db
+            .select({ id: schema.dosageForms.id })
+            .from(schema.dosageForms)
+            .where(eq(schema.dosageForms.medicationId, id)),
+        ),
+      )
+      .returning({ id: schema.schedules.id });
+
+    return { medicationId: id, enabled, schedulesUpdated: updated.length };
+  }
+
   async restart(id: string, userId: string, dto: RestartMedicationDto) {
     const medication = await this.findOne(id, userId);
 

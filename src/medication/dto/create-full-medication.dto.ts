@@ -55,6 +55,31 @@ export class FullScheduleDto {
   @IsString()
   timezone?: string;
 
+  @ApiPropertyOptional({
+    description: 'Cyclic regimen: days on. Requires cycleOffDays.',
+    minimum: 1,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  cycleOnDays?: number;
+
+  @ApiPropertyOptional({
+    description: 'Cyclic regimen: days off. Requires cycleOnDays.',
+    minimum: 1,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  cycleOffDays?: number;
+
+  @ApiPropertyOptional({
+    description: 'Day 1 of the first on-phase; defaults to the start date.',
+  })
+  @IsOptional()
+  @IsDateString()
+  cycleAnchorDate?: string;
+
   @ApiPropertyOptional()
   @IsOptional()
   @IsBoolean()
