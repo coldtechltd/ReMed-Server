@@ -190,6 +190,25 @@ describe('EntitlementService.assertCompanionLimit', () => {
     });
   });
 
+  // The joiner cannot fix the owner's plan, so they must never be told to buy
+  // anything — but the machine-readable code stays the same so the app can
+  // still branch on it.
+  it('addresses the joiner without an upsell when they are the caller', async () => {
+    const svc = new EntitlementService(companionDb(free, COMPANION_LIMITS.free));
+    await expect(
+      svc.assertCompanionLimit('owner', 'joiner'),
+    ).rejects.toMatchObject({
+      response: { code: COMPANION_LIMIT_REACHED, audience: 'joiner' },
+    });
+    await expect(
+      new EntitlementService(
+        companionDb(free, COMPANION_LIMITS.free),
+      ).assertCompanionLimit('owner', 'joiner'),
+    ).rejects.toMatchObject({
+      response: { message: expect.not.stringContaining('Upgrade') },
+    });
+  });
+
   // The upgrade path: the same count that blocks a free user is fine on pro.
   it('lets a pro user past the free ceiling', async () => {
     const svc = new EntitlementService(companionDb(pro, COMPANION_LIMITS.free));

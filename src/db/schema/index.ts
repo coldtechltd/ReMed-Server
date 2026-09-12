@@ -15,4 +15,5 @@ export * from './cron-lock';
 export * from './audit-log';
 export * from './consent-record';
 export * from './companion-link';
+export * from './companion-code';
 export * from './relations';

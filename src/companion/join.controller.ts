@@ -1,7 +1,7 @@
 import { Controller, Get, Header, Param } from '@nestjs/common';
 import { ApiExcludeController } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
-import { normalizeInviteCode } from './invite-code.util';
+import { normalizeCompanionCode } from './companion-code.util';
 
 const APP_SCHEME = 'medapp';
 const APP_STORE_URL = 'https://apps.apple.com/app/remed';
@@ -29,7 +29,7 @@ export class JoinController {
   join(@Param('code') code: string): string {
     // Normalize and re-encode before it reaches the template — the raw path
     // segment is untrusted input being written into HTML and a URL.
-    const safe = normalizeInviteCode(code).slice(0, 16);
+    const safe = normalizeCompanionCode(code).slice(0, 16);
     const deepLink = `${APP_SCHEME}://join?code=${encodeURIComponent(safe)}`;
 
     return `<!doctype html>
@@ -38,7 +38,7 @@ export class JoinController {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>Your ReMed invite</title>
+<title>Join on ReMed</title>
 <style>
   :root { color-scheme: light dark; }
   body {
@@ -79,7 +79,7 @@ export class JoinController {
 <a class="btn" href="${deepLink}">Open in ReMed</a>
 
 <div class="stores">
-  <p>Don't have the app yet? Install it, then enter the code above.</p>
+  <p>Don't have the app yet? Install it, then enter the code above &mdash; you can do that before you finish signing up.</p>
   <p>
     <a href="${APP_STORE_URL}">App Store</a> &middot;
     <a href="${PLAY_STORE_URL}">Google Play</a>

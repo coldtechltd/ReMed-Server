@@ -2,6 +2,7 @@ import {
   BadRequestException,
   Inject,
   Injectable,
+  InternalServerErrorException,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
@@ -11,15 +12,27 @@ import { and, desc, eq, inArray, or } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
 import { EntitlementService } from '../billing/entitlement.service';
-import { CreateInviteDto } from './dto/create-invite.dto';
 import { UpdateCompanionLinkDto } from './dto/update-companion-link.dto';
 import {
-  generateInviteCode,
-  hashInviteCode,
-  inviteExpiryFrom,
-} from './invite-code.util';
+  generateCompanionCode,
+  normalizeCompanionCode,
+} from './companion-code.util';
 
 export type CompanionLink = typeof schema.companionLinks.$inferSelect;
+
+/** What the owner's sharing screen needs to render the code and the seat count. */
+export interface CompanionCodeView {
+  code: string;
+  /** Shareable https link that deep-links the code into the app. */
+  url: string;
+  createdAt: Date;
+  rotatedAt: Date | null;
+  tier: string;
+  /** Companion seats this tier allows. */
+  limit: number;
+  /** Seats currently taken by an active companion. */
+  used: number;
+}
 
 @Injectable()
 export class CompanionService {
@@ -41,113 +54,151 @@ export class CompanionService {
     return `${base.replace(/\/$/, '')}/join/${code}`;
   }
 
-  /**
-   * Creates a pending invite. The plaintext code is returned exactly once —
-   * only its hash is stored, so it cannot be re-read later (the owner revokes
-   * and re-invites instead).
-   */
-  async createInvite(ownerId: string, dto: CreateInviteDto) {
-    await this.entitlements.assertCompanionLimit(ownerId);
-
-    const code = generateInviteCode();
-    const expiresAt = inviteExpiryFrom();
-
-    const [link] = await this.db
-      .insert(schema.companionLinks)
-      .values({
-        ownerId,
-        label: dto.label ?? null,
-        inviteCodeHash: hashInviteCode(code),
-        expiresAt,
-      })
-      .returning();
-
-    return { ...link, code, url: this.joinUrl(code) };
+  private async view(
+    ownerId: string,
+    row: typeof schema.companionCodes.$inferSelect,
+  ): Promise<CompanionCodeView> {
+    const seats = await this.entitlements.companionSeats(ownerId);
+    return {
+      code: row.code,
+      url: this.joinUrl(row.code),
+      createdAt: row.createdAt,
+      rotatedAt: row.rotatedAt,
+      ...seats,
+    };
   }
 
   /**
-   * Redeems a code. Deliberately vague on failure: a valid-but-expired code and
-   * a code that never existed return the same message, so this route can't be
-   * used to probe which codes are real.
+   * Inserts a fresh code for a user, retrying on the astronomically unlikely
+   * unique-index collision rather than surfacing it as a 500.
+   *
+   * `onConflictDoUpdate` on the primary key makes this double as rotation: the
+   * row is per user, so re-issuing is an update in the same statement — and
+   * `rotatedAt` lands only on that conflict branch, which is exactly when a
+   * code really was replaced rather than minted.
    */
-  async acceptInvite(companionId: string, rawCode: string) {
-    const [link] = await this.db
+  private async issueCode(
+    ownerId: string,
+  ): Promise<typeof schema.companionCodes.$inferSelect> {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const code = generateCompanionCode();
+      try {
+        const [row] = await this.db
+          .insert(schema.companionCodes)
+          .values({ userId: ownerId, code })
+          .onConflictDoUpdate({
+            target: schema.companionCodes.userId,
+            set: { code, rotatedAt: new Date() },
+          })
+          .returning();
+        return row;
+      } catch (e) {
+        // 23505 is unique_violation, which here can only be the code index —
+        // the userId conflict is handled above. Anything else is a real fault.
+        if ((e as { code?: string }).code !== '23505') throw e;
+        this.logger.warn(
+          `Companion code collision on attempt ${attempt + 1}, retrying`,
+        );
+      }
+    }
+    throw new InternalServerErrorException(
+      'Could not allocate a companion code. Please try again.',
+    );
+  }
+
+  /**
+   * The owner's durable sharing code, created on first read.
+   *
+   * Lazy creation on purpose: most users never share, and a code that exists
+   * for someone who has never opened the screen is a credential with no owner
+   * watching it.
+   */
+  async getMyCode(ownerId: string): Promise<CompanionCodeView> {
+    const [existing] = await this.db
       .select()
-      .from(schema.companionLinks)
-      .where(
-        and(
-          eq(schema.companionLinks.inviteCodeHash, hashInviteCode(rawCode)),
-          eq(schema.companionLinks.status, 'pending'),
-        ),
-      )
+      .from(schema.companionCodes)
+      .where(eq(schema.companionCodes.userId, ownerId))
       .limit(1);
 
-    if (!link || link.expiresAt.getTime() < Date.now()) {
-      throw new BadRequestException('That invite code is not valid any more.');
+    if (existing) return this.view(ownerId, existing);
+    return this.view(ownerId, await this.issueCode(ownerId));
+  }
+
+  /**
+   * Issues a new code and retires the old one. Existing companions keep their
+   * access — rotation governs who may join from here on, not who already has.
+   * Revoking someone is a separate, deliberate action.
+   */
+  async rotateCode(ownerId: string): Promise<CompanionCodeView> {
+    const row = await this.issueCode(ownerId);
+    this.logger.log(`Companion code rotated: owner=${ownerId}`);
+    return this.view(ownerId, row);
+  }
+
+  /**
+   * Redeems an owner's code into an active link.
+   *
+   * Deliberately vague on failure: an unknown code and a code belonging to
+   * someone who has since rotated return the same message, so this route
+   * cannot be used to probe which codes are real.
+   */
+  async redeemCode(companionId: string, rawCode: string) {
+    const normalized = normalizeCompanionCode(rawCode);
+
+    const [owner] = await this.db
+      .select({ ownerId: schema.companionCodes.userId })
+      .from(schema.companionCodes)
+      .where(eq(schema.companionCodes.code, normalized))
+      .limit(1);
+
+    if (!owner) {
+      throw new BadRequestException('That code is not valid.');
     }
 
-    if (link.ownerId === companionId) {
-      throw new BadRequestException('You cannot accept your own invite.');
+    if (owner.ownerId === companionId) {
+      throw new BadRequestException('That is your own code.');
     }
 
-    // Re-accepting from a second device, or a fresh invite from someone who
-    // already shares with you, should be a no-op rather than tripping the
-    // partial unique index.
+    // Re-entering a code you have already redeemed — from a second device, or
+    // because the owner sent it again — is a no-op rather than an error or a
+    // duplicate row.
     const [existing] = await this.db
       .select()
       .from(schema.companionLinks)
       .where(
         and(
-          eq(schema.companionLinks.ownerId, link.ownerId),
+          eq(schema.companionLinks.ownerId, owner.ownerId),
           eq(schema.companionLinks.companionId, companionId),
           eq(schema.companionLinks.status, 'active'),
         ),
       )
       .limit(1);
 
-    if (existing) {
-      // Retire the now-redundant invite so it stops occupying a seat.
-      await this.db
-        .update(schema.companionLinks)
-        .set({
-          status: 'revoked',
-          revokedAt: new Date(),
-          revokedBy: companionId,
-          inviteCodeHash: null,
-        })
-        .where(eq(schema.companionLinks.id, link.id));
-      return existing;
-    }
+    if (existing) return existing;
 
-    const [accepted] = await this.db
-      .update(schema.companionLinks)
-      .set({
+    // Seats belong to the owner, but it is the joiner who is standing here, so
+    // the message is written for them (see assertCompanionLimit).
+    await this.entitlements.assertCompanionLimit(owner.ownerId, 'joiner');
+
+    const now = new Date();
+    const [link] = await this.db
+      .insert(schema.companionLinks)
+      .values({
+        ownerId: owner.ownerId,
         companionId,
         status: 'active',
-        acceptedAt: new Date(),
-        // Single use: the code stops working the moment it is redeemed.
-        inviteCodeHash: null,
+        invitedAt: now,
+        acceptedAt: now,
       })
-      .where(
-        and(
-          eq(schema.companionLinks.id, link.id),
-          // Guards against two devices racing the same code.
-          eq(schema.companionLinks.status, 'pending'),
-        ),
-      )
       .returning();
 
-    if (!accepted) {
-      throw new BadRequestException('That invite code is not valid any more.');
-    }
-
     this.logger.log(
-      `Companion link accepted: owner=${link.ownerId} companion=${companionId}`,
+      `Companion link created: owner=${owner.ownerId} companion=${companionId}`,
     );
-    return accepted;
+    return link;
   }
 
-  /** The owner's management list: who they share with, plus unredeemed invites. */
+  /** The owner's management list: the people who can currently see their doses. */
   async listOutgoing(ownerId: string) {
     const rows = await this.db
       .select({
@@ -167,10 +218,10 @@ export class CompanionService {
       .where(
         and(
           eq(schema.companionLinks.ownerId, ownerId),
-          inArray(schema.companionLinks.status, ['pending', 'active']),
+          eq(schema.companionLinks.status, 'active'),
         ),
       )
-      .orderBy(desc(schema.companionLinks.invitedAt));
+      .orderBy(desc(schema.companionLinks.acceptedAt));
 
     return rows.map(({ link, companionName, companionEmail }) => ({
       id: link.id,
@@ -179,10 +230,12 @@ export class CompanionService {
       // A companion who never created a profile has no fullName — that is the
       // normal case, since companions skip profile creation entirely.
       label: link.label ?? companionName ?? companionEmail ?? 'Companion',
+      // Kept so the owner can tell a name they typed from one the profile
+      // supplied, and prefill the rename field with the former.
+      customLabel: link.label,
       notifyMissedDose: link.notifyMissedDose,
       notifyRefill: link.notifyRefill,
       invitedAt: link.invitedAt,
-      expiresAt: link.expiresAt,
       acceptedAt: link.acceptedAt,
       lastViewedAt: link.lastViewedAt,
     }));
@@ -244,7 +297,7 @@ export class CompanionService {
         and(
           eq(schema.companionLinks.id, id),
           eq(schema.companionLinks.ownerId, ownerId),
-          inArray(schema.companionLinks.status, ['pending', 'active']),
+          eq(schema.companionLinks.status, 'active'),
         ),
       )
       .returning();
@@ -256,6 +309,10 @@ export class CompanionService {
   /**
    * Revoke by link id. Either side may do it — the owner withdrawing access and
    * the companion stepping away are the same operation.
+   *
+   * Revoking does not touch the owner's sharing code: the removed companion
+   * could redeem it again if they still have it, which is why `rotateCode`
+   * exists and why the app offers it alongside a removal.
    */
   async revoke(userId: string, id: string) {
     const [revoked] = await this.db
@@ -264,7 +321,6 @@ export class CompanionService {
         status: 'revoked',
         revokedAt: new Date(),
         revokedBy: userId,
-        inviteCodeHash: null,
       })
       .where(
         and(
@@ -273,7 +329,7 @@ export class CompanionService {
             eq(schema.companionLinks.ownerId, userId),
             eq(schema.companionLinks.companionId, userId),
           ),
-          inArray(schema.companionLinks.status, ['pending', 'active']),
+          eq(schema.companionLinks.status, 'active'),
         ),
       )
       .returning();

@@ -14,13 +14,16 @@ import { users } from './user';
  * A read-only grant from one user (the owner) to another (the companion), so a
  * caregiver can watch someone's doses and get missed-dose / refill alerts.
  *
- * The row is also the consent record for the share: `invitedAt` is the owner
- * granting it, `acceptedAt` is the companion accepting, `revokedAt` is either
- * side withdrawing. (Terms/Privacy acceptance is separate and already captured
- * in consent_records at signup.)
+ * The row is also the consent record for the share: `acceptedAt` is the moment
+ * the companion redeemed the owner's code, `revokedAt` is either side
+ * withdrawing. (Terms/Privacy acceptance is separate and already captured in
+ * consent_records at signup.)
  *
- * A link is `pending` until redeemed: `companionId` is null and the invite code
- * exists only as a hash, so a database leak can't be replayed into access.
+ * Rows are created at redemption and are `active` from birth — the pending
+ * half-state belonged to the single-use invite model this replaced, where a row
+ * existed from the moment the owner generated a code. The sharing code now
+ * lives in its own table (`companion_codes`) and is not per-link, so there is
+ * nothing to record until someone actually joins.
  */
 export const companionLinks = pgTable(
   'companion_links',
@@ -29,22 +32,20 @@ export const companionLinks = pgTable(
     ownerId: uuid('owner_id')
       .references(() => users.id)
       .notNull(),
-    // Null until the invite is accepted — a pending invite has no recipient yet.
+    // Nullable only because legacy pending rows predate the persistent-code
+    // model; every row this code path creates has a companion.
     companionId: uuid('companion_id').references(() => users.id),
-    // sha256 hex of the invite code, nulled once redeemed. The plaintext code is
-    // returned to the owner exactly once, at creation.
-    inviteCodeHash: varchar('invite_code_hash', { length: 64 }),
-    // The owner's nickname for the invitee ("Mum"), shown before they accept —
-    // until then there is no profile to read a name from.
+    // The owner's nickname for this companion ("Mum"), set after they join.
+    // Falls back to their profile name in the API response.
     label: varchar('label', { length: 100 }),
     // Only 'viewer' is implemented. Present so a future write-capable role
     // ('caregiver') is an additive change rather than a migration.
     role: varchar('role', { length: 20 }).notNull().default('viewer'),
-    status: varchar('status', { length: 20 }).notNull().default('pending'), // pending | active | revoked
+    // active | revoked. 'pending' is legacy — see the note above.
+    status: varchar('status', { length: 20 }).notNull().default('active'),
     notifyMissedDose: boolean('notify_missed_dose').default(true).notNull(),
     notifyRefill: boolean('notify_refill').default(true).notNull(),
     invitedAt: timestamp('invited_at').defaultNow(),
-    expiresAt: timestamp('expires_at').notNull(),
     acceptedAt: timestamp('accepted_at'),
     revokedAt: timestamp('revoked_at'),
     // Either side can revoke, so record which one did.
@@ -59,10 +60,8 @@ export const companionLinks = pgTable(
       table.companionId,
       table.status,
     ),
-    // Invite redemption is a lookup by hash.
-    index('companion_links_code_idx').on(table.inviteCodeHash),
-    // One live link per pair. Partial, so revoked history and multiple pending
-    // invites (which have a null companionId) are still allowed.
+    // One live link per pair. Partial, so revoked history is still allowed and
+    // someone can be re-added after being removed.
     uniqueIndex('companion_links_active_pair_idx')
       .on(table.ownerId, table.companionId)
       .where(sql`${table.status} = 'active'`),

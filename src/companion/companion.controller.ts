@@ -17,7 +17,7 @@ import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { CompanionService } from './companion.service';
 import { CompanionAccessGuard } from './guards/companion-access.guard';
 import { CreateInviteDto } from './dto/create-invite.dto';
-import { AcceptInviteDto } from './dto/accept-invite.dto';
+import { RedeemCodeDto } from './dto/redeem-code.dto';
 import { UpdateCompanionLinkDto } from './dto/update-companion-link.dto';
 import { MedicationService } from '../medication/medication.service';
 import { DosageFormService } from '../dosage-form/dosage-form.service';
@@ -25,7 +25,8 @@ import { DoseEventService } from '../dose-event/dose-event.service';
 import type { MedicationStatus } from '../medication/dto/create-medication.dto';
 
 /**
- * Companion sharing: read-only access for an invited second person.
+ * Companion sharing: read-only access for a second person who redeemed the
+ * owner's sharing code.
  *
  * The read routes live here rather than as a flag on the owner's endpoints so
  * that `req.user.id` keeps meaning "the tenant" everywhere else in the app — a
@@ -49,13 +50,26 @@ export class CompanionController {
 
   // ---------------------------------------------------------------- owner side
 
-  @Post('invites')
+  @Get('code')
   @ApiOperation({
     summary:
-      'Create an invite. The plaintext code is returned once and never again.',
+      'My companion code — the one I share so someone can watch my doses. Created on first read and stable until rotated. Also reports how many companion seats my plan allows.',
   })
-  createInvite(@Request() req, @Body() dto: CreateInviteDto) {
-    return this.companionService.createInvite(req.user.id, dto);
+  myCode(@Request() req) {
+    return this.companionService.getMyCode(req.user.id);
+  }
+
+  // Rotation invalidates a code other people may be holding, so it is not a
+  // button anyone should be able to hammer — and a runaway client loop would
+  // otherwise churn the owner's code faster than they could share it.
+  @Throttle({ default: { limit: 5, ttl: 60000 } })
+  @Post('code/rotate')
+  @ApiOperation({
+    summary:
+      'Replace my companion code. Existing companions keep their access; only future joins are affected.',
+  })
+  rotate(@Request() req) {
+    return this.companionService.rotateCode(req.user.id);
   }
 
   @Get('invites')
@@ -77,7 +91,7 @@ export class CompanionController {
   }
 
   @Delete('invites/:id')
-  @ApiOperation({ summary: 'Revoke an invite or an active companion link' })
+  @ApiOperation({ summary: "Remove a companion's access" })
   revokeInvite(@Request() req, @Param('id') id: string) {
     return this.companionService.revoke(req.user.id, id);
   }
@@ -85,12 +99,13 @@ export class CompanionController {
   // ------------------------------------------------------------ companion side
 
   // Tighter than the global 100/min: this is the only route that takes a guess
-  // at a secret, so it is the one brute-force surface the feature adds.
+  // at a secret, so it is the one brute-force surface the feature adds. At 5/min
+  // the 32^8 keyspace needs ~400,000 years to sweep.
   @Throttle({ default: { limit: 5, ttl: 60000 } })
-  @Post('accept')
-  @ApiOperation({ summary: 'Redeem an invite code' })
-  acceptInvite(@Request() req, @Body() dto: AcceptInviteDto) {
-    return this.companionService.acceptInvite(req.user.id, dto.code);
+  @Post('redeem')
+  @ApiOperation({ summary: "Redeem someone's companion code" })
+  redeem(@Request() req, @Body() dto: RedeemCodeDto) {
+    return this.companionService.redeemCode(req.user.id, dto.code);
   }
 
   @Get('following')
@@ -103,6 +118,33 @@ export class CompanionController {
   @ApiOperation({ summary: 'Stop following someone (companion-initiated)' })
   stopFollowing(@Request() req, @Param('ownerId') ownerId: string) {
     return this.companionService.stopFollowing(req.user.id, ownerId);
+  }
+
+  // ------------------------------------------------------------- compatibility
+  //
+  // Already-shipped clients call these two. They are kept so an app build from
+  // before persistent codes keeps working rather than dead-ending on a 404:
+  // `invites` hands back the durable code where it used to mint a single-use
+  // one, and `accept` is just the new redeem route under its old name. Both
+  // can go once the old builds are out of circulation.
+
+  @Post('invites')
+  @ApiOperation({ deprecated: true, summary: 'Use GET /companion/code.' })
+  createInvite(
+    @Request() req,
+    // The body is ignored, but it still has to be declared: without @Body the
+    // global whitelist never inspects it, and old clients post `{ label }`.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    @Body() _dto: CreateInviteDto,
+  ) {
+    return this.companionService.getMyCode(req.user.id);
+  }
+
+  @Throttle({ default: { limit: 5, ttl: 60000 } })
+  @Post('accept')
+  @ApiOperation({ deprecated: true, summary: 'Use POST /companion/redeem.' })
+  acceptInvite(@Request() req, @Body() dto: RedeemCodeDto) {
+    return this.companionService.redeemCode(req.user.id, dto.code);
   }
 
   // ----------------------------------------------------------- companion reads

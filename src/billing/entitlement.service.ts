@@ -1,6 +1,6 @@
 import { HttpException, HttpStatus, Inject, Injectable } from '@nestjs/common';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { and, eq, inArray, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
 
@@ -148,12 +148,17 @@ export class EntitlementService {
   }
 
   /**
-   * Throws 402 when the owner already has as many companion links as their
-   * tier allows. Pending invites count: an unredeemed code is a seat held.
+   * How many companions an owner has, and how many their tier allows.
+   *
+   * Surfaced on the owner's sharing screen so the seat limit is visible before
+   * they hand their code out, rather than only as an error someone else trips.
+   * Counts active links only: under the persistent-code model nothing is
+   * reserved in advance, so a seat is held by a real companion or by no one.
    */
-  async assertCompanionLimit(userId: string): Promise<Tier> {
+  async companionSeats(
+    userId: string,
+  ): Promise<{ tier: Tier; limit: number; used: number }> {
     const tier = await this.getTier(userId);
-    const limit = COMPANION_LIMITS[tier];
 
     const [row] = await this.db
       .select({ used: sql<number>`count(*)::int` })
@@ -161,10 +166,26 @@ export class EntitlementService {
       .where(
         and(
           eq(schema.companionLinks.ownerId, userId),
-          inArray(schema.companionLinks.status, ['pending', 'active']),
+          eq(schema.companionLinks.status, 'active'),
         ),
       );
-    const used = row?.used ?? 0;
+
+    return { tier, limit: COMPANION_LIMITS[tier], used: row?.used ?? 0 };
+  }
+
+  /**
+   * Throws 402 when the owner has no companion seats left.
+   *
+   * `audience` picks the wording, because this now fires on the redeeming
+   * side: the person reading the message is usually the would-be companion,
+   * who cannot fix it and must not be told to buy anything. The machine-
+   * readable `code` is identical either way, so the app still branches on it.
+   */
+  async assertCompanionLimit(
+    userId: string,
+    audience: 'owner' | 'joiner' = 'owner',
+  ): Promise<Tier> {
+    const { tier, limit, used } = await this.companionSeats(userId);
 
     if (used >= limit) {
       throw new HttpException(
@@ -173,10 +194,13 @@ export class EntitlementService {
           tier,
           limit,
           used,
+          audience,
           message:
-            tier === 'free'
-              ? 'Free accounts can share with one companion. Upgrade to ReMed Pro to add more.'
-              : `You can share with up to ${limit} companions.`,
+            audience === 'joiner'
+              ? "They've already shared with as many people as their plan allows. Ask them to remove someone, or to upgrade to ReMed Pro."
+              : tier === 'free'
+                ? 'Free accounts can share with one companion. Upgrade to ReMed Pro to add more.'
+                : `You can share with up to ${limit} companions.`,
         },
         HttpStatus.PAYMENT_REQUIRED,
       );
