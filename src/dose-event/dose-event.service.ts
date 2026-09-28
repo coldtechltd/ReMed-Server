@@ -529,13 +529,24 @@ export class DoseEventService {
     const [event] = await this.db
       .insert(schema.doseEvents)
       .values({
+        ...(dto.clientId ? { id: dto.clientId } : {}),
         scheduleId: schedule.id,
         scheduledFor: takenAt,
         takenAt,
         status: 'taken',
         reminderSent: true,
       })
+      .onConflictDoNothing({ target: schema.doseEvents.id })
       .returning();
+
+    if (!event) {
+      // Only reachable with a clientId: this log already landed — the app
+      // replayed a queued request whose first attempt reached us but whose
+      // response didn't make it back. Return the original, and don't debit
+      // stock a second time. findOne scopes by user, so an id belonging to
+      // someone else is a 404 rather than a disclosure.
+      return this.findOne(dto.clientId!, userId);
+    }
 
     // Same stock rule as update(): only forms that track stock, floored at 0.
     if (form.dosageForm.quantityOnHand !== null) {

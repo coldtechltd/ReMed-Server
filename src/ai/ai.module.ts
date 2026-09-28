@@ -1,3 +1,4 @@
+import { NotificationsModule } from '../notifications/notifications.module';
 import { Module } from '@nestjs/common';
 import { ProfileModule } from '../profile/profile.module';
 import { MedicationModule } from '../medication/medication.module';
@@ -8,7 +9,13 @@ import { AiService } from './ai.service';
 import { MedicationContextService } from './medication-context.service';
 
 @Module({
-  imports: [ProfileModule, MedicationModule, BillingModule, DoseEventModule],
+  imports: [
+    ProfileModule,
+    MedicationModule,
+    BillingModule,
+    DoseEventModule,
+    NotificationsModule,
+  ],
   controllers: [AiController],
   providers: [AiService, MedicationContextService],
 })

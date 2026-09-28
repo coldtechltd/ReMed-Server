@@ -23,6 +23,7 @@ import { MailModule } from './common/mail/mail.module';
 
 import { APP_INTERCEPTOR } from '@nestjs/core';
 import { AuditInterceptor } from './common/interceptors/audit.interceptor';
+import { DeviceSyncInterceptor } from './common/interceptors/device-sync.interceptor';
 
 @Module({
   imports: [
@@ -61,6 +62,10 @@ import { AuditInterceptor } from './common/interceptors/audit.interceptor';
     {
       provide: APP_INTERCEPTOR,
       useClass: AuditInterceptor,
+    },
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: DeviceSyncInterceptor,
     },
   ],
 })

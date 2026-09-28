@@ -29,6 +29,15 @@ export const doseEvents = pgTable(
     companionAlertSentAt: timestamp('companion_alert_sent_at'),
     snoozeCount: integer('snooze_count').default(0).notNull(),
     createdAt: timestamp('created_at').defaultNow(),
+    // Bumped on every write through Drizzle. It is the version stamp for the
+    // local-reminder lease (device_sessions.localReminders): a device's
+    // on-phone reminder stands in for push only while the event still carries
+    // the updatedAt the phone scheduled, so any later edit falls back to push
+    // instead of going unreminded.
+    updatedAt: timestamp('updated_at')
+      .defaultNow()
+      .notNull()
+      .$onUpdate(() => new Date()),
   },
   (table) => [
     // Per-schedule lookups: generator idempotency checks, by-date screens,

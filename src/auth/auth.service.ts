@@ -81,7 +81,17 @@ export class AuthService {
 
     if (existing) {
       const updates: Record<string, unknown> = { lastSeenAt: new Date() };
-      if (pushToken) updates.expoPushToken = pushToken;
+      if (pushToken) {
+        updates.expoPushToken = pushToken;
+      } else {
+        // Every other caller is a sign-in. The app cleared its on-phone
+        // reminders when that device's previous session ended — possibly
+        // without reaching /auth/logout (offline, expired token) — so a claim
+        // still stored here describes notifications that no longer exist and
+        // would suppress pushes until the app re-syncs.
+        updates.localReminders = null;
+        updates.localRemindersSyncedAt = null;
+      }
       const [session] = await this.db
         .update(deviceSessions)
         .set(updates)
@@ -102,11 +112,21 @@ export class AuthService {
   }
 
   // Invalidate only this device's tokens by bumping its own tokenVersion —
-  // other devices the user is signed into keep working.
+  // other devices the user is signed into keep working. The push token goes:
+  // reminders name the user's medications, and a signed-out phone must stop
+  // receiving them (the app re-registers its token on the next sign-in). The
+  // local-reminder claim goes too: the app cancels its on-phone reminders on
+  // sign-out, and a claim left behind would suppress pushes for doses nothing
+  // now reminds.
   async logout(userId: string, deviceId: string) {
     await this.db
       .update(deviceSessions)
-      .set({ tokenVersion: sql`${deviceSessions.tokenVersion} + 1` })
+      .set({
+        tokenVersion: sql`${deviceSessions.tokenVersion} + 1`,
+        expoPushToken: null,
+        localReminders: null,
+        localRemindersSyncedAt: null,
+      })
       .where(
         and(
           eq(deviceSessions.userId, userId),

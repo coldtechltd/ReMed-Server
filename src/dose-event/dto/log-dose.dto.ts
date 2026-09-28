@@ -1,4 +1,4 @@
-import { IsISO8601, IsOptional, IsString } from 'class-validator';
+import { IsISO8601, IsOptional, IsString, IsUUID } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 export class LogDoseDto {
@@ -13,4 +13,15 @@ export class LogDoseDto {
   @IsOptional()
   @IsISO8601()
   takenAt?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Client-generated UUID for this log, used as the dose event id. Makes the ' +
+      'request idempotent: the app queues logs made offline and may replay one ' +
+      'that already reached the server, and a replay must not log the dose (or ' +
+      'debit stock) twice.',
+  })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
 }

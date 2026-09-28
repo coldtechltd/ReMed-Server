@@ -16,6 +16,7 @@ import { CreateFullMedicationDto } from '../medication/dto/create-full-medicatio
 import { CreateMedicationArgsDto } from './dto/chat.dto';
 import { EntitlementService } from '../billing/entitlement.service';
 import { DoseEventService } from '../dose-event/dose-event.service';
+import { NotificationsService } from '../notifications/notifications.service';
 
 export interface TokenUsage {
   input: number;
@@ -473,6 +474,7 @@ export class AiService {
     private readonly medicationContextService: MedicationContextService,
     private readonly entitlements: EntitlementService,
     private readonly doseEventService: DoseEventService,
+    private readonly notifications: NotificationsService,
     @Inject(DRIZZLE_CLIENT)
     private readonly db: NodePgDatabase<typeof schema>,
   ) {
@@ -803,6 +805,10 @@ export class AiService {
           ? { snoozeMinutes: args.snoozeMinutes ?? 15 }
           : { status: args.action },
       );
+      // Server-side write outside the DeviceSyncInterceptor's reach (it
+      // arrives as POST /ai/chat); the caller's device isn't known here, so
+      // every device re-syncs its on-phone reminders.
+      this.notifications.requestDeviceSync(userId);
 
       return {
         status: 'ok',
@@ -1027,6 +1033,7 @@ export class AiService {
             userId,
             this.mapArgsToDto(priorPendingAction.args, timezone),
           );
+          this.notifications.requestDeviceSync(userId);
           toolResult = {
             status: 'ok',
             message: 'Medication created successfully.',

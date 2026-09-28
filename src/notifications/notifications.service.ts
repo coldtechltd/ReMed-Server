@@ -5,6 +5,7 @@ import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import {
   eq,
   and,
+  asc,
   or,
   gte,
   lte,
@@ -12,6 +13,7 @@ import {
   isNull,
   inArray,
   isNotNull,
+  ne,
 } from 'drizzle-orm';
 import { Expo, ExpoPushMessage, ExpoPushTicket } from 'expo-server-sdk';
 import * as schema from '../db/schema';
@@ -25,6 +27,13 @@ import {
   REFILL_LEAD_TIME_DAYS,
 } from '../dosage-form/stock.util';
 import {
+  LOCAL_REMINDER_WINDOW_MS,
+  MAX_LOCAL_REMINDERS,
+  doseReminderCopy,
+  isCoveredLocally,
+  sanitizeClaim,
+} from './local-reminders.util';
+import {
   companionMissedDoseCopy,
   companionRefillCopy,
   MissedDoseItem,
@@ -37,6 +46,8 @@ const RECEIPT_CHECK_DELAY_MS = 5 * 60 * 1000;
 const RECEIPT_GIVE_UP_MS = 60 * 60 * 1000;
 // Guard against unbounded growth if the receipt API is down for a long stretch.
 const MAX_PENDING_RECEIPTS = 5000;
+/** Coalescing window for device-sync pushes. See requestDeviceSync. */
+const SYNC_PUSH_DEBOUNCE_MS = 5_000;
 /**
  * How long delivery rows are kept. Long enough to answer "why didn't I get my
  * reminder last week?" and to compute a monthly delivery rate; short enough
@@ -83,6 +94,11 @@ export class NotificationsService {
   // In memory on purpose: receipts are a diagnostic, not state worth a table.
   // A restart loses at most one window of them.
   private pendingReceipts: PendingReceipt[] = [];
+  // In memory: a lost debounce on restart just means one fewer sync push.
+  private readonly pendingDeviceSyncs = new Map<
+    string,
+    { originDeviceId?: string; timer: ReturnType<typeof setTimeout> }
+  >();
 
   constructor(
     @Inject(DRIZZLE_CLIENT)
@@ -148,6 +164,215 @@ export class NotificationsService {
       .from(schema.notificationPreferences)
       .where(inArray(schema.notificationPreferences.userId, userIds));
     return new Map(rows.map((r) => [r.userId, r]));
+  }
+
+  /**
+   * The dose reminders this device should schedule on-phone: pending doses due
+   * within LOCAL_REMINDER_WINDOW_MS, filtered exactly as the push cron filters
+   * them, so the phone never reminds a dose the server would not.
+   *
+   * Read-only. The device owns nothing until it has actually scheduled these
+   * and called claimLocalReminders — a phone that fails to schedule (no
+   * permission, OS limit) must keep receiving push.
+   */
+  async getLocalReminderSnapshot(userId: string) {
+    const now = new Date();
+    const prefs = await this.getPreferences(userId);
+    if (!prefs.doseRemindersEnabled) {
+      return { generatedAt: now.toISOString(), reminders: [] };
+    }
+
+    const rows = await this.db
+      .select({
+        event: schema.doseEvents,
+        medication: schema.medications,
+        dosageForm: schema.dosageForms,
+      })
+      .from(schema.doseEvents)
+      .innerJoin(
+        schema.schedules,
+        eq(schema.doseEvents.scheduleId, schema.schedules.id),
+      )
+      .innerJoin(
+        schema.dosageForms,
+        eq(schema.schedules.dosageFormId, schema.dosageForms.id),
+      )
+      .innerJoin(
+        schema.medications,
+        eq(schema.dosageForms.medicationId, schema.medications.id),
+      )
+      .where(
+        and(
+          eq(schema.medications.userId, userId),
+          eq(schema.doseEvents.status, 'pending'),
+          eq(schema.doseEvents.reminderSent, false),
+          eq(schema.schedules.isActive, true),
+          eq(schema.medications.status, 'active'),
+          // Future only: a dose already due is the push cron's to deliver
+          // within the minute, and a local notification in the past fires
+          // immediately — a duplicate at best.
+          gte(schema.doseEvents.scheduledFor, now),
+          lt(
+            schema.doseEvents.scheduledFor,
+            new Date(now.getTime() + LOCAL_REMINDER_WINDOW_MS),
+          ),
+        ),
+      )
+      .orderBy(asc(schema.doseEvents.scheduledFor))
+      .limit(MAX_LOCAL_REMINDERS);
+
+    return {
+      generatedAt: now.toISOString(),
+      reminders: rows.map((r) => ({
+        eventId: r.event.id,
+        scheduledFor: r.event.scheduledFor.toISOString(),
+        updatedAt: r.event.updatedAt.toISOString(),
+        ...doseReminderCopy(r.medication, r.dosageForm),
+      })),
+    };
+  }
+
+  /**
+   * Record which dose reminders this device now holds on-phone, replacing any
+   * earlier claim. Only the user's own events are kept.
+   */
+  async claimLocalReminders(
+    userId: string,
+    deviceId: string,
+    entries: { eventId: string; updatedAt: string }[],
+  ) {
+    const ids = entries.map((e) => e.eventId);
+    const owned =
+      ids.length === 0
+        ? []
+        : await this.db
+            .select({ id: schema.doseEvents.id })
+            .from(schema.doseEvents)
+            .innerJoin(
+              schema.schedules,
+              eq(schema.doseEvents.scheduleId, schema.schedules.id),
+            )
+            .innerJoin(
+              schema.dosageForms,
+              eq(schema.schedules.dosageFormId, schema.dosageForms.id),
+            )
+            .innerJoin(
+              schema.medications,
+              eq(schema.dosageForms.medicationId, schema.medications.id),
+            )
+            .where(
+              and(
+                eq(schema.medications.userId, userId),
+                inArray(schema.doseEvents.id, ids),
+              ),
+            );
+
+    const claim = sanitizeClaim(entries, new Set(owned.map((r) => r.id)));
+    await this.setLocalReminderClaim(userId, deviceId, claim);
+    return { claimed: Object.keys(claim).length };
+  }
+
+  /**
+   * Drop this device's claim so every dose goes back to push — used when the
+   * phone cancels its local notifications (reminders switched off, permission
+   * revoked, sign-out).
+   */
+  async releaseLocalReminders(userId: string, deviceId: string) {
+    await this.setLocalReminderClaim(userId, deviceId, null);
+  }
+
+  /**
+   * Tell the user's other devices to re-sync their on-phone reminders.
+   *
+   * An on-phone reminder can't be recalled by the server: once a dose is
+   * logged early on a tablet, or a medication is deleted, the phone's local
+   * copy would still fire. So any change that alters what should be reminded
+   * is followed by a silent push (data only; iOS content-available) that wakes
+   * the app to re-sync in the background.
+   *
+   * Coalesced per user for SYNC_PUSH_DEBOUNCE_MS: logging three doses in a row
+   * is one push, not three — iOS rations silent pushes, and spending the
+   * budget on bursts would get later ones dropped. Only devices that keep an
+   * on-phone schedule (they have synced at least once) are targeted: an older
+   * build would render the empty message as a blank banner in the foreground.
+   *
+   * `originDeviceId` is the device that made the change; it re-syncs on its
+   * own, so it is skipped. Omit it for server-side changes (crons, AI tools
+   * whose caller isn't known) to reach every device.
+   */
+  requestDeviceSync(userId: string, originDeviceId?: string) {
+    const pending = this.pendingDeviceSyncs.get(userId);
+    if (pending) {
+      // Two different origins in one window: nobody can be skipped.
+      if (pending.originDeviceId !== originDeviceId) {
+        pending.originDeviceId = undefined;
+      }
+      return;
+    }
+    const entry = {
+      originDeviceId,
+      timer: setTimeout(() => {
+        this.pendingDeviceSyncs.delete(userId);
+        void this.sendDeviceSync(userId, entry.originDeviceId);
+      }, SYNC_PUSH_DEBOUNCE_MS),
+    };
+    this.pendingDeviceSyncs.set(userId, entry);
+  }
+
+  private async sendDeviceSync(userId: string, originDeviceId?: string) {
+    try {
+      const devices = await this.db
+        .select({ token: schema.deviceSessions.expoPushToken })
+        .from(schema.deviceSessions)
+        .where(
+          and(
+            eq(schema.deviceSessions.userId, userId),
+            isNotNull(schema.deviceSessions.expoPushToken),
+            isNotNull(schema.deviceSessions.localRemindersSyncedAt),
+            ...(originDeviceId
+              ? [ne(schema.deviceSessions.deviceId, originDeviceId)]
+              : []),
+          ),
+        );
+
+      const messages: ExpoPushMessage[] = devices
+        .map((d) => d.token)
+        .filter((t): t is string => !!t && Expo.isExpoPushToken(t))
+        .map((to) => ({
+          to,
+          data: { type: 'sync' },
+          // No title/body/sound: Expo sends it as an iOS background push, and
+          // Android hands a data-only message to the background task without
+          // showing anything.
+          _contentAvailable: true,
+          priority: 'normal',
+        }));
+      // No delivery contexts: these aren't user-visible notifications, and
+      // logging them would skew the reminder delivery rate.
+      if (messages.length > 0) await this.sendPush(messages);
+    } catch (error) {
+      // Best effort. The next foreground sync catches the device up anyway.
+      this.logger.warn(`Device sync push failed for ${userId}`, error);
+    }
+  }
+
+  private async setLocalReminderClaim(
+    userId: string,
+    deviceId: string,
+    claim: Record<string, string> | null,
+  ) {
+    await this.db
+      .update(schema.deviceSessions)
+      .set({
+        localReminders: claim,
+        localRemindersSyncedAt: claim ? new Date() : null,
+      })
+      .where(
+        and(
+          eq(schema.deviceSessions.userId, userId),
+          eq(schema.deviceSessions.deviceId, deviceId),
+        ),
+      );
   }
 
   /**
@@ -251,11 +476,29 @@ export class NotificationsService {
         ...new Set(pendingDoses.map((d) => d.medication.userId)),
       ]);
 
+      // Doses a device already has as an on-phone notification (its
+      // local-reminder lease). Pushing those would remind twice; they count
+      // as reminded, same as a delivered ticket.
+      const coveredEventIds = new Set<string>();
+      const localRows: NewDeliveryRow[] = [];
+
       for (const dose of pendingDoses) {
         if (
           prefsByUser.get(dose.medication.userId)?.doseRemindersEnabled ===
           false
         ) {
+          continue;
+        }
+
+        if (isCoveredLocally(dose.device.localReminders, dose.event)) {
+          coveredEventIds.add(dose.event.id);
+          localRows.push({
+            userId: dose.medication.userId,
+            category: 'dose_reminder',
+            refId: dose.event.id,
+            pushToken: dose.device.expoPushToken,
+            status: 'local',
+          });
           continue;
         }
 
@@ -270,8 +513,7 @@ export class NotificationsService {
         messages.push({
           to: pushToken,
           sound: 'default',
-          title: `Time to take ${dose.medication.name}`,
-          body: `${dose.dosageForm.dosageAmount} ${dose.dosageForm.dosageUnit} of ${dose.dosageForm.name}`,
+          ...doseReminderCopy(dose.medication, dose.dosageForm),
           data: { eventId: dose.event.id },
           categoryId: 'dose_reminder',
           // Android needs both of these or a dose reminder arrives late and
@@ -291,15 +533,20 @@ export class NotificationsService {
         });
       }
 
-      if (messages.length === 0) return;
+      await this.recordDeliveries(localRows);
+      if (messages.length === 0 && coveredEventIds.size === 0) return;
 
       // Only mark events whose ticket actually came back 'ok'; results are
       // index-aligned with messages / eventIdPerMessage. A dose can appear
-      // once per device, so dedupe before updating — one delivered ticket is
-      // enough to mark the event as reminded.
-      const results = await this.sendPush(messages, contexts);
+      // once per device, so dedupe before updating — one delivered ticket, or
+      // one device holding it locally, is enough to mark the event as reminded.
+      const results: boolean[] =
+        messages.length > 0 ? await this.sendPush(messages, contexts) : [];
       const sentEventIds = [
-        ...new Set(eventIdPerMessage.filter((_, i) => results[i])),
+        ...new Set([
+          ...eventIdPerMessage.filter((_, i) => results[i]),
+          ...coveredEventIds,
+        ]),
       ];
 
       // Mark successfully-delivered events so they aren't re-sent. Failed ones
@@ -311,7 +558,9 @@ export class NotificationsService {
           .where(inArray(schema.doseEvents.id, sentEventIds));
       }
 
-      this.logger.log(`Sent ${sentEventIds.length} medication reminders.`);
+      this.logger.log(
+        `Sent ${sentEventIds.length - coveredEventIds.size} medication reminders; ${coveredEventIds.size} held on-device.`,
+      );
     } catch (error: any) {
       const code = error?.cause?.code;
       if (code === 'ETIMEDOUT' || code === 'ENOTFOUND' || code === 'XX000') {

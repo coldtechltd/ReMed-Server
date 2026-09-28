@@ -11,7 +11,8 @@ import { users } from './user';
  * the in-memory receipt queue is per-instance and vanishes on restart.
  *
  * Status moves accepted -> delivered | failed (or straight to `rejected` when
- * Expo refuses the ticket outright).
+ * Expo refuses the ticket outright). `local` rows are terminal: the device
+ * owned that reminder, so there is no ticket or receipt to follow.
  *
  * Deliberately does NOT store notification body text: these rows are diagnostic
  * and the body names the user's medication, which is exactly the health data
@@ -31,7 +32,11 @@ export const notificationDeliveries = pgTable(
     pushToken: varchar('push_token', { length: 255 }),
     /** Expo ticket id — null when Expo rejected the message outright. */
     ticketId: varchar('ticket_id', { length: 255 }),
-    /** 'accepted' | 'rejected' | 'delivered' | 'failed' */
+    /**
+     * 'accepted' | 'rejected' | 'delivered' | 'failed', or 'local' when no push
+     * was sent because the device had the reminder scheduled on-phone (its
+     * local-reminder lease covered the dose).
+     */
     status: varchar('status', { length: 20 }).notNull(),
     /** Expo's error code, e.g. DeviceNotRegistered / MessageRateExceeded. */
     errorCode: varchar('error_code', { length: 100 }),
