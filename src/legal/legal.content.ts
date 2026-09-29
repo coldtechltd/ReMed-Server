@@ -15,7 +15,7 @@
 export const COMPANY_NAME = 'ColdTech';
 export const CONTACT_EMAIL = 'coldtechltd01@gmail.com';
 export const APP_NAME = 'ReMed';
-export const LAST_UPDATED = '5 September 2026';
+export const LAST_UPDATED = '29 September 2026';
 
 function page(title: string, body: string): string {
   return `<!doctype html>
@@ -80,6 +80,7 @@ export const PRIVACY_POLICY_HTML = page(
 <p>We use a small number of processors to run the service:</p>
 <ul>
   <li><strong>Groq</strong> — powers the wellness assistant. When you use the AI tab we send your message, the recent conversation, and a summary of your medications and relevant profile details (diagnosed conditions, height, weight, gender) for processing. Do not enter anything in the chat you would not want processed this way.</li>
+  <li><strong>Apple and Google speech recognition</strong> — only if you speak to the assistant using the microphone button. Your phone's speech service (Apple's on iPhone, Google's on Android) turns what you say into text. Where your device supports it this happens on the device; otherwise the audio is sent to Apple or Google to be transcribed. We never receive or store the audio. The text appears in the message box for you to review, and reaches us only if you send it, when it is handled like any other chat message.</li>
   <li><strong>Expo</strong> — delivers push notifications. Receives your push token and the reminder text.</li>
   <li><strong>Sentry</strong> — error monitoring, both in the app and on our servers. Receives crash and error reports: the fault itself, your device model, operating system and app version, and a short trail of the screens you opened and the requests the app made just before it, each recorded as a path without its query. Reports carry your account identifier so we can tell how many people a fault affects. We filter medication names, profile fields, and chat contents out of these reports; server-side reports may still incidentally include technical request details when something fails.</li>
   <li><strong>PostHog</strong> — product analytics. Receives which screens you open and which actions you take, keyed to your account identifier. It does not receive your medication names, profile fields, or chat contents.</li>
