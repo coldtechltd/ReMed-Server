@@ -42,12 +42,8 @@ export class AiController {
     @Request() req,
     @Body() dto: ChatDto,
   ): Promise<{ reply: string; pendingAction?: PendingAction }> {
-    return this.aiService.chat(
-      req.user.id,
-      dto.message,
-      dto.history,
-      dto.timezone,
-    );
+    // dto.history is accepted for old builds but deliberately not passed on.
+    return this.aiService.chat(req.user.id, dto.message, dto.timezone);
   }
 
   @Get('chat/history')

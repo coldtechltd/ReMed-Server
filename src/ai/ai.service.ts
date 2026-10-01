@@ -1,19 +1,19 @@
 import { Injectable, Inject, Logger } from '@nestjs/common';
 import Groq from 'groq-sdk';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { desc, eq } from 'drizzle-orm';
+import { asc, desc, eq } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
 import { ProfileService } from '../profile/profile.service';
 import { MedicationService } from '../medication/medication.service';
 import { MedicationContextService } from './medication-context.service';
+import { dayKeyInTz, localDateParts } from '../schedule/schedule.util';
 import {
-  assertValidScheduleTypeFields,
-  dayKeyInTz,
-  localDateParts,
-} from '../schedule/schedule.util';
-import { CreateFullMedicationDto } from '../medication/dto/create-full-medication.dto';
-import { CreateMedicationArgsDto } from './dto/chat.dto';
+  FORM_TYPES,
+  MedicationProposal,
+  normalizeProposal,
+  toCreateFullDto,
+} from './medication-proposal.util';
 import { EntitlementService } from '../billing/entitlement.service';
 import { DoseEventService } from '../dose-event/dose-event.service';
 import { NotificationsService } from '../notifications/notifications.service';
@@ -62,7 +62,12 @@ STYLE:
 Keep responses short — 2 to 5 sentences. Be warm, encouraging, and non-clinical, with a light touch of personality when it suits the conversation. Avoid jokes or cheerfulness when the user is worried or describes serious symptoms. Write in plain prose. Never output JSON, code blocks, key/value field dumps, or raw tool arguments — the app renders structured details itself, so describe things in ordinary sentences.
 
 ADDING A MEDICATION REMINDER:
-- Gather: medication name, dosage amount/unit, form (tablet, liquid, injection, etc.), a full schedule (interval, specific times, or as-needed), and a start date. Ask short follow-up questions for whatever is missing — one or two at a time, not a form.
+- Gather: the medication's name; for each drug in it, the drug name, amount per dose, unit and form (tablet, liquid, injection, etc.); a full schedule (interval, specific times, or as-needed); a start date; an end date if it is a course; and the stock on hand if they mention it. Ask short follow-up questions for whatever is missing — one or two at a time, not a form.
+- One medication can hold several drugs taken together as one treatment ("flu treatment: paracetamol and piritin, two of each three times a day"). Give each drug its own entry in drugs, with its own amount, schedule and stock ("12 of each" means 12 for each drug). Never merge drugs into one entry or move a drug into the notes. A single drug is a drugs list of one, named the same as the medication.
+- name is the label for the whole medication. Dose counts and frequencies are not part of it: "Flu Treatment 2 pills daily" is the name "Flu Treatment" with 2 pills daily. If it is genuinely unclear where the name ends, ask.
+- "N times a day" means specific_times. Ask when they take them, or if they leave it to you, space them across waking hours (twice: 08:00 and 20:00; three times: 08:00, 14:00 and 20:00) — the card shows the times so they can correct them. Use interval only for "every N hours/days/weeks", and give firstDoseTime.
+- If the user gives an end ("until the 5th", "for 7 days"), set endDate to the last day doses are taken. Otherwise leave it null; the medication carries on until they stop it.
+- Resolve relative dates ("today", "tomorrow", "the 5th", "Monday") against Today's date in your context, which is already in the user's own timezone.
 - Once you have enough details, call propose_medication. This does NOT create anything; the app shows the user a review card built from your arguments. Your own message should just be one short sentence asking them to confirm — do not restate the fields.
 - Only call create_medication on a LATER turn, after the user has explicitly confirmed (e.g. "yes", "go ahead", "confirm") the proposal from your immediately preceding message. Never call create_medication in the same turn as propose_medication, and never without a clear confirmation.
 - If the user asks to change something before confirming, call propose_medication again with the corrected details.
@@ -123,7 +128,11 @@ export interface ChatMessage {
 
 export interface PendingMedicationAction {
   tool: 'create_medication';
-  args: CreateMedicationArgsDto;
+  /**
+   * A normalized proposal. Rows stored before drugs[] existed hold the legacy
+   * single-drug shape instead, which normalizeProposal still accepts.
+   */
+  args: MedicationProposal;
 }
 
 export interface DoseActionArgs {
@@ -152,40 +161,25 @@ export type PendingAction = PendingMedicationAction | PendingDoseAction;
 // handing them back, and the model habitually emits an explicit `null` for
 // every optional field it isn't using rather than omitting the key. A bare
 // `type: 'string'` therefore fails validation with `tool_use_failed`, so every
-// non-required field accepts null and the nulls are stripped in `stripNulls`.
-const MEDICATION_TOOL_PARAMETERS = {
+// non-required field accepts null and the nulls are stripped in `stripNulls`
+// (recursively, since drugs are nested).
+const DRUG_PARAMETERS = {
   type: 'object',
   properties: {
     name: {
       type: 'string',
       description:
-        'The medication name exactly as the user gave it, e.g. "Metformin". Never invent a placeholder such as "Medication" — if the user has not said the name yet, ask them instead of calling this tool.',
-    },
-    notes: {
-      type: ['string', 'null'],
-      description: 'Optional free-text notes',
-    },
-    startDate: {
-      type: 'string',
-      description:
-        'ISO 8601 date (YYYY-MM-DD) the course starts. Resolve relative terms like "today" or "tomorrow" using the current date given in your context.',
+        'This drug\'s name exactly as the user gave it, e.g. "Paracetamol".',
     },
     dosageFormType: {
       type: 'string',
-      enum: [
-        'tablet',
-        'capsule',
-        'liquid',
-        'injection',
-        'cream',
-        'inhaler',
-        'patch',
-        'drops',
-        'other',
-      ],
+      enum: [...FORM_TYPES],
       description: 'Physical form of the dose',
     },
-    dosageAmount: { type: 'integer', description: 'Quantity per dose, e.g. 1' },
+    dosageAmount: {
+      type: 'integer',
+      description: 'Units of this drug per dose, e.g. 2',
+    },
     dosageUnit: {
       type: ['string', 'null'],
       description: 'Unit, e.g. "tablet", "ml". Default "pills".',
@@ -197,7 +191,7 @@ const MEDICATION_TOOL_PARAMETERS = {
     quantityOnHand: {
       type: ['integer', 'null'],
       description:
-        'Current stock the user has on hand, if mentioned. Null if unknown.',
+        'Units of THIS drug the user has on hand, if mentioned. Null if unknown.',
     },
     refillThreshold: {
       type: ['integer', 'null'],
@@ -206,22 +200,23 @@ const MEDICATION_TOOL_PARAMETERS = {
     scheduleType: {
       type: 'string',
       enum: ['interval', 'specific_times', 'as_needed'],
+      description:
+        '"specific_times" for "N times a day" or named times; "interval" only for "every N hours/days/weeks"; "as_needed" for when needed.',
     },
     intervalValue: {
       type: ['integer', 'null'],
-      description:
-        'Required if scheduleType is "interval", e.g. 8. Null otherwise.',
+      description: 'Required for "interval", e.g. 8. Null otherwise.',
     },
     intervalUnit: {
       type: ['string', 'null'],
-      enum: ['minutes', 'hours', 'days', null],
-      description: 'Required if scheduleType is "interval". Null otherwise.',
+      enum: ['minutes', 'hours', 'days', 'weeks', null],
+      description: 'Required for "interval". Null otherwise.',
     },
     specificTimes: {
       type: ['array', 'null'],
       items: { type: 'string' },
       description:
-        'Required if scheduleType is "specific_times". 24h "HH:MM" strings, e.g. ["08:00", "20:00"]. Null otherwise.',
+        'Required for "specific_times". 24h "HH:MM" in the user\'s local time, e.g. ["08:00", "14:00", "20:00"]. Null otherwise.',
     },
     daysOfWeek: {
       type: ['array', 'null'],
@@ -229,19 +224,47 @@ const MEDICATION_TOOL_PARAMETERS = {
       description:
         'Optional days filter, e.g. ["Mon", "Wed", "Fri"]. Null for every day.',
     },
-    firstDoseAt: {
+    firstDoseTime: {
       type: ['string', 'null'],
-      description: 'Optional ISO datetime of the first dose',
+      description:
+        'For "interval": 24h "HH:MM" local time of the first dose on the start date. Null for other schedules.',
     },
-    asNeeded: { type: ['boolean', 'null'] },
   },
-  required: [
-    'name',
-    'startDate',
-    'dosageFormType',
-    'dosageAmount',
-    'scheduleType',
-  ],
+  required: ['name', 'dosageFormType', 'dosageAmount', 'scheduleType'],
+};
+
+const MEDICATION_TOOL_PARAMETERS = {
+  type: 'object',
+  properties: {
+    name: {
+      type: 'string',
+      description:
+        'The medication\'s label, e.g. "Flu Treatment" or "Metformin", without dose counts or frequency. Never invent a placeholder such as "Medication" — if the user has not said the name yet, ask them instead of calling this tool.',
+    },
+    notes: {
+      type: ['string', 'null'],
+      description:
+        'Optional free-text notes. Never put a drug, a dose, a schedule or a date here — each has its own field.',
+    },
+    startDate: {
+      type: 'string',
+      description:
+        'YYYY-MM-DD the medication starts. Resolve "today" or "tomorrow" using the current date given in your context.',
+    },
+    endDate: {
+      type: ['string', 'null'],
+      description:
+        'YYYY-MM-DD of the last day doses are taken, when the user gives an end ("until the 5th", "for 7 days"). Null for an ongoing medication.',
+    },
+    drugs: {
+      type: 'array',
+      minItems: 1,
+      items: DRUG_PARAMETERS,
+      description:
+        'Every drug in this medication, each with its own amount, schedule and stock. One entry for a single drug.',
+    },
+  },
+  required: ['name', 'startDate', 'drugs'],
 };
 
 const MEDICATION_TOOLS: Groq.Chat.ChatCompletionTool[] = [
@@ -579,7 +602,6 @@ export class AiService {
   async chat(
     userId: string,
     message: string,
-    history: ChatMessage[] = [],
     timezone = 'UTC',
   ): Promise<{ reply: string; pendingAction?: PendingAction }> {
     // Before any work: the context build below runs four DB queries, so a
@@ -589,12 +611,13 @@ export class AiService {
 
     // The server's own record of the conversation, not the client's.
     //
-    // `history` from the request is ignored for anything that matters. It used
+    // The request's `history` isn't even passed in (see ChatDto.history). It used
     // to carry the pending medication proposal, which meant a crafted request
     // could present a proposal the assistant never made and have
     // create_medication execute against it. The stored thread is the only
     // thing that can confirm what the server actually said.
     const storedHistory = await this.loadHistory(userId);
+    const turnStartedAt = new Date();
 
     try {
       const result = await this.runChat(
@@ -605,7 +628,7 @@ export class AiService {
         usage,
       );
 
-      await this.persistTurn(userId, message, result);
+      await this.persistTurn(userId, message, result, turnStartedAt);
       return result;
     } finally {
       // In `finally` so every exit path is metered — including the ones that
@@ -620,7 +643,12 @@ export class AiService {
       .select()
       .from(schema.aiMessages)
       .where(eq(schema.aiMessages.userId, userId))
-      .orderBy(desc(schema.aiMessages.createdAt))
+      // The role tie-break is for rows written before persistTurn stamped its
+      // two messages apart: they share a timestamp, and without it the pair
+      // came back in either order — to the model as well as to the app.
+      // Newest first here, so "assistant" sorts ahead of "user" and the
+      // reverse below puts the question before its reply.
+      .orderBy(desc(schema.aiMessages.createdAt), asc(schema.aiMessages.role))
       .limit(HISTORY_LIMIT);
 
     return rows.reverse().map((row) => ({
@@ -633,6 +661,11 @@ export class AiService {
   /**
    * Append the user's message and the assistant's reply.
    *
+   * Both rows used to take the column default, and one insert means one
+   * transaction timestamp, so every pair tied and was read back in either
+   * order. Stamping them explicitly, the reply strictly after the question,
+   * keeps the thread in order for the app and for the model's own context.
+   *
    * Errors are swallowed: losing a line of transcript is a far smaller failure
    * than throwing away a reply the user already paid quota for.
    */
@@ -640,15 +673,20 @@ export class AiService {
     userId: string,
     message: string,
     result: { reply: string; pendingAction?: PendingAction },
+    turnStartedAt: Date,
   ) {
+    const repliedAt = new Date(
+      Math.max(Date.now(), turnStartedAt.getTime() + 1),
+    );
     try {
       await this.db.insert(schema.aiMessages).values([
-        { userId, role: 'user', content: message },
+        { userId, role: 'user', content: message, createdAt: turnStartedAt },
         {
           userId,
           role: 'assistant',
           content: result.reply,
           pendingAction: result.pendingAction ?? null,
+          createdAt: repliedAt,
         },
       ]);
     } catch (error) {
@@ -848,7 +886,8 @@ export class AiService {
       })
       .from(schema.aiMessages)
       .where(eq(schema.aiMessages.userId, userId))
-      .orderBy(desc(schema.aiMessages.createdAt))
+      // Same tie-break as loadHistory, for pairs stored with one timestamp.
+      .orderBy(desc(schema.aiMessages.createdAt), asc(schema.aiMessages.role))
       .limit(Math.min(limit, HISTORY_PAGE_LIMIT));
 
     return rows.reverse();
@@ -906,7 +945,7 @@ export class AiService {
       SYSTEM_PROMPT,
       profileContext ? `User context: ${profileContext}` : '',
       medicationContext,
-      `Today's date: ${this.todayString(timezone)}.`,
+      `Today's date: ${this.todayString(timezone)}, in the user's timezone.`,
       priorPendingAction
         ? `You previously proposed creating this medication (awaiting confirmation): ${JSON.stringify(priorPendingAction.args)}. If the user's new message confirms it, call create_medication. If they want changes, call propose_medication again with corrected details. If they decline or change the subject, do not call any tool for this proposal.`
         : '',
@@ -955,7 +994,9 @@ export class AiService {
             }
           : {}),
         temperature: 0.6,
-        max_tokens: 500,
+        // A multi-drug proposal is a few hundred tokens of arguments on top
+        // of the hidden reasoning; 500 risked truncating it mid-call.
+        max_tokens: 900,
       });
       const { input, output } = readUsage(completion);
       usage.input += input;
@@ -1000,15 +1041,11 @@ export class AiService {
 
     if (toolCall.function.name === 'propose_medication') {
       try {
-        assertValidScheduleTypeFields({
-          type: args.scheduleType,
-          intervalValue: args.intervalValue,
-          intervalUnit: args.intervalUnit,
-          specificTimes: args.specificTimes,
-        });
+        // Checked and tidied now, so the card shows exactly what a "yes"
+        // will create, and a bad argument goes back to the model to fix.
         pendingAction = {
           tool: 'create_medication',
-          args: args as CreateMedicationArgsDto,
+          args: normalizeProposal(args),
         };
         toolResult = {
           status: 'ok',
@@ -1033,16 +1070,14 @@ export class AiService {
         try {
           // Execute against the stored proposal, never the model's freshly
           // re-emitted args, so what the user confirmed is exactly what gets
-          // written to the DB.
-          assertValidScheduleTypeFields({
-            type: priorPendingAction.args.scheduleType,
-            intervalValue: priorPendingAction.args.intervalValue,
-            intervalUnit: priorPendingAction.args.intervalUnit,
-            specificTimes: priorPendingAction.args.specificTimes,
-          });
+          // written to the DB. Normalized again because a proposal stored
+          // before drugs[] existed is in the legacy single-drug shape.
+          const proposal = normalizeProposal(
+            priorPendingAction.args as unknown as Record<string, unknown>,
+          );
           const created = await this.medicationService.createFull(
             userId,
-            this.mapArgsToDto(priorPendingAction.args, timezone),
+            toCreateFullDto(proposal, timezone),
           );
           this.notifications.requestDeviceSync(userId);
           toolResult = {
@@ -1159,9 +1194,18 @@ export class AiService {
    * validators and DTO downstream expect those keys to simply be absent.
    */
   private stripNulls(args: Record<string, any>): Record<string, any> {
-    return Object.fromEntries(
-      Object.entries(args).filter(([, value]) => value !== null),
-    );
+    const strip = (value: unknown): unknown => {
+      if (Array.isArray(value)) return value.map(strip);
+      if (value && typeof value === 'object') {
+        return Object.fromEntries(
+          Object.entries(value)
+            .filter(([, v]) => v !== null)
+            .map(([k, v]) => [k, strip(v)]),
+        );
+      }
+      return value;
+    };
+    return strip(args) as Record<string, any>;
   }
 
   /**
@@ -1214,48 +1258,23 @@ export class AiService {
       .replace(/<function=[^>]*>/gi, '')
       .replace(/```[\s\S]*?```/g, '')
       .replace(/\{[\s\S]*\}/g, '')
+      // The app renders plain text, so markdown emphasis showed up as
+      // literal asterisks ("**2 tablets per dose**").
+      .replace(/\*\*(.+?)\*\*/g, '$1')
+      .replace(/__(.+?)__/g, '$1')
       .replace(/\n{3,}/g, '\n\n')
       .trim();
     return cleaned.length >= 10 ? cleaned : fallback;
   }
 
+  /** "2026-10-01 (Thursday)": the weekday lets the model resolve "Monday". */
   private todayString(timezone: string): string {
     const { year, month0, day } = localDateParts(new Date(), timezone);
-    return `${year}-${String(month0 + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-  }
-
-  private mapArgsToDto(
-    args: CreateMedicationArgsDto,
-    timezone: string,
-  ): CreateFullMedicationDto {
-    return {
-      name: args.name,
-      notes: args.notes,
-      startDate: args.startDate,
-      dosageForms: [
-        {
-          name: args.name,
-          type: args.dosageFormType,
-          dosageAmount: args.dosageAmount,
-          dosageUnit: args.dosageUnit,
-          route: args.route,
-          quantityOnHand: args.quantityOnHand,
-          refillThreshold: args.refillThreshold,
-          schedules: [
-            {
-              type: args.scheduleType,
-              intervalValue: args.intervalValue,
-              intervalUnit: args.intervalUnit,
-              specificTimes: args.specificTimes,
-              daysOfWeek: args.daysOfWeek,
-              firstDoseAt: args.firstDoseAt,
-              timezone,
-              asNeeded: args.asNeeded,
-              isActive: true,
-            },
-          ],
-        },
-      ],
-    };
+    const date = `${year}-${String(month0 + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    const weekday = new Date(Date.UTC(year, month0, day)).toLocaleDateString(
+      'en-US',
+      { weekday: 'long', timeZone: 'UTC' },
+    );
+    return `${date} (${weekday})`;
   }
 }

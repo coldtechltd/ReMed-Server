@@ -109,9 +109,11 @@ The counting rules live in `dose-event/adherence.util.ts`, pure and tested; `get
 
 ### AI (`src/ai/`)
 
-Groq (`llama-3.3-70b-versatile`) with tool-calling. The safety-critical system prompt in `ai.service.ts` draws the line between *recording a medication the user already takes* (always allowed) and *recommending or diagnosing* (never) — edit it with care, it is the entire safety boundary.
+Groq (`openai/gpt-oss-120b`, a reasoning model run at `reasoning_effort: 'low'`) with tool-calling. The safety-critical system prompt in `ai.service.ts` draws the line between *recording a medication the user already takes* (always allowed) and *recommending or diagnosing* (never) — edit it with care, it is the entire safety boundary.
 
 - Two-step tool flow: `propose_medication` renders a review card client-side and creates nothing; `create_medication` may only fire on a **later** turn after explicit confirmation, and executes against the stored `priorPendingAction.args`, never the model's re-emitted arguments. That's why its schema is a single `confirmed` boolean.
+- **Proposals are checked and converted by `medication-proposal.util.ts`** (pure, tested). A proposal is a medication with a `drugs[]` list, each drug with its own form, amount, stock and schedule, plus an optional `endDate`, which makes the medication a course. A proposal used to hold one drug and no end date, so "paracetamol and piritin, two of each, until the 5th" was saved as one open-ended drug with the rest in the notes. `normalizeProposal` runs on propose (so the card shows what a "yes" will create) and again on create (so a legacy single-drug proposal still works). Interval schedules take a local `firstDoseTime` that defaults to 08:00. With no first dose, they used to start at the start date's midnight UTC.
+- `persistTurn` stamps the user row and the reply explicitly, the reply strictly later. One insert used to give both the same transaction timestamp, so pairs were read back in either order, to the model as well as to the app. History reads also tie-break on `role` for rows written before the fix.
 - Tool schemas cost ~1k input tokens, so they're attached only when `needsMedicationTools` matches (deliberately generous — a false negative loses a medication the user asked for).
 - llama-3.3 emits explicit `null` for unused optional fields, so every non-required tool property accepts `['string','null']` and nulls are stripped in `stripNulls`; a bare `type: 'string'` fails Groq validation with `tool_use_failed`.
 - Tips are cached per user for 24h (`ai_tips_cache`); serving from cache must not spend quota.
@@ -125,6 +127,6 @@ Groq (`llama-3.3-70b-versatile`) with tool-calling. The safety-critical system p
 ## Conventions worth matching
 
 - Comments in this codebase explain *why* a non-obvious rule exists (DST anchoring, the stock boundary, receipt polling, snooze preservation). Keep that style; those comments are load-bearing documentation.
-- User-facing "day" boundaries are computed in the user's IANA timezone (`dayBoundsInTz`, `endOfDayInTz`) and fall back to server-local rather than 500ing on a bad zone.
+- User-facing "day" boundaries are computed in the user's IANA timezone (`dayBoundsInTz`, `endOfDayInTz`) and fall back to server-local rather than 500ing on a bad zone. The zone comes from `DoseEventService.resolveTimezone`: the request's `?tz=` for a user's own reads, else `profiles.timezone` (reported by the app via `PATCH /profile/locale`, B12). Companion reads pass `ownerTimezone: true`, so the owner's stored zone wins over the companion's own.
 - Dose-event reads filter with `notStoppedBefore`, which hides events scheduled after a medication's `completedAt` — stopped medications shouldn't linger on the home screen.
 - Tests are colocated `*.spec.ts` and cover the pure utilities and billing parsing (`schedule.util`, `stock.util`, `adherence.util`, `entitlement.service`, `revenuecat.types`, auth). New timing/stock rules belong in those pure modules so they stay testable without a database.

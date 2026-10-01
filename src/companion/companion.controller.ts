@@ -185,6 +185,7 @@ export class CompanionController {
   ) {
     return this.doseEventService.findEventsByDate(ownerId, date, tz, {
       excludePrivate: true,
+      ownerTimezone: true,
     });
   }
 
@@ -204,6 +205,7 @@ export class CompanionController {
       limit,
       tz,
       excludePrivate: true,
+      ownerTimezone: true,
     });
   }
 
@@ -218,6 +220,7 @@ export class CompanionController {
   ) {
     return this.doseEventService.getStats(ownerId, from, to, tz, {
       excludePrivate: true,
+      ownerTimezone: true,
     });
   }
 }

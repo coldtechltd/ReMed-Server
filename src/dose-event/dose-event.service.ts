@@ -45,6 +45,30 @@ export class DoseEventService {
       : [];
   }
 
+  /**
+   * The zone a read buckets calendar days in (B12).
+   *
+   * A user's own reads use the zone their device sent, falling back to the one
+   * their phone last reported for callers that send none. A companion's read
+   * is about someone else's day, so the owner's stored zone wins there: a
+   * caregiver in London looking at a parent in Lagos should see the parent's
+   * Tuesday, not their own. The request's zone remains the fallback for an
+   * owner whose app predates B12 and has stored nothing.
+   */
+  private async resolveTimezone(
+    userId: string,
+    requestTz: string | undefined,
+    preferStored: boolean,
+  ): Promise<string | undefined> {
+    if (requestTz && !preferStored) return requestTz;
+    const [row] = await this.db
+      .select({ timezone: schema.profiles.timezone })
+      .from(schema.profiles)
+      .where(eq(schema.profiles.userId, userId))
+      .limit(1);
+    return row?.timezone ?? requestTz;
+  }
+
   private readonly notStoppedBefore = sql`(
     ${schema.medications.status} <> 'completed'
     OR ${schema.doseEvents.scheduledFor} <= coalesce(${schema.medications.completedAt}, ${schema.doseEvents.scheduledFor})
@@ -109,8 +133,16 @@ export class DoseEventService {
       limit?: number;
       tz?: string;
       excludePrivate?: boolean;
+      /** Bucket days in the owner's stored zone (companion reads). */
+      ownerTimezone?: boolean;
     },
   ) {
+    const tz = await this.resolveTimezone(
+      userId,
+      opts?.tz,
+      Boolean(opts?.ownerTimezone),
+    );
+
     // Optional window. Callers that pass nothing (the app's "N remaining"
     // badge) keep the original unbounded behaviour; the widget snapshot passes
     // from/days/limit so it doesn't drag the full 90-day materialization
@@ -127,7 +159,7 @@ export class DoseEventService {
     ];
 
     if (opts?.from) {
-      const bounds = opts.tz ? this.dayBoundsInTz(opts.from, opts.tz) : null;
+      const bounds = tz ? this.dayBoundsInTz(opts.from, tz) : null;
       let start: Date;
       if (bounds) {
         start = bounds.startOfDay;
@@ -183,9 +215,14 @@ export class DoseEventService {
   async findEventsByDate(
     userId: string,
     dateStr: string,
-    tz?: string,
-    opts?: { excludePrivate?: boolean },
+    requestTz?: string,
+    opts?: { excludePrivate?: boolean; ownerTimezone?: boolean },
   ) {
+    const tz = await this.resolveTimezone(
+      userId,
+      requestTz,
+      Boolean(opts?.ownerTimezone),
+    );
     // With a tz, "the day" is the user's calendar day, not the server's —
     // otherwise doses near midnight land on the wrong date in the app.
     let startOfDay: Date;
@@ -266,9 +303,14 @@ export class DoseEventService {
     userId: string,
     fromStr?: string,
     toStr?: string,
-    tz?: string,
-    opts?: { excludePrivate?: boolean },
+    requestTz?: string,
+    opts?: { excludePrivate?: boolean; ownerTimezone?: boolean },
   ) {
+    const tz = await this.resolveTimezone(
+      userId,
+      requestTz,
+      Boolean(opts?.ownerTimezone),
+    );
     // Default window: last 30 days (inclusive of today). With a tz, both the
     // window bounds and the per-day buckets below use the user's calendar
     // days — server-local bucketing put doses near midnight on the wrong day

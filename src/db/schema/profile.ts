@@ -29,5 +29,12 @@ export const profiles = pgTable('profiles', {
   allergies: varchar('allergies', { length: 500 }),
   emergencyContactName: varchar('emergency_contact_name', { length: 255 }),
   emergencyContactPhone: varchar('emergency_contact_phone', { length: 20 }),
+  // The IANA zone and BCP 47 locale the user's phone last reported (B12), kept
+  // fresh by the app on launch and foreground. Reads the owner makes pass
+  // their device's zone anyway; this is for reads where nobody can: a
+  // companion viewing the owner's day, and server-side callers with no
+  // request to take a zone from.
+  timezone: varchar('timezone', { length: 64 }),
+  locale: varchar('locale', { length: 35 }),
   createdAt: timestamp('created_at').defaultNow(),
 });

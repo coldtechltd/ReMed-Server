@@ -1,92 +1,23 @@
 import {
   IsArray,
-  IsBoolean,
-  IsDateString,
   IsIn,
-  IsInt,
+  IsObject,
   IsOptional,
   IsString,
-  Min,
   ValidateNested,
 } from 'class-validator';
 import { Type } from 'class-transformer';
-import { SCHEDULE_TYPES } from '../../schedule/dto/create-schedule.dto';
-
-// Args the AI proposes/executes for medication creation — one medication,
-// one dosage form, one schedule per call (multi-form regimens are out of
-// scope for chat; users are pointed to the Medications screen for those).
-export class CreateMedicationArgsDto {
-  @IsString()
-  name: string;
-
-  @IsOptional()
-  @IsString()
-  notes?: string;
-
-  @IsDateString()
-  startDate: string;
-
-  @IsString()
-  dosageFormType: string;
-
-  @IsInt()
-  dosageAmount: number;
-
-  @IsOptional()
-  @IsString()
-  dosageUnit?: string;
-
-  @IsOptional()
-  @IsString()
-  route?: string;
-
-  @IsOptional()
-  @IsInt()
-  @Min(0)
-  quantityOnHand?: number;
-
-  @IsOptional()
-  @IsInt()
-  @Min(0)
-  refillThreshold?: number;
-
-  @IsIn(SCHEDULE_TYPES)
-  scheduleType: string;
-
-  @IsOptional()
-  @IsInt()
-  intervalValue?: number;
-
-  @IsOptional()
-  @IsString()
-  intervalUnit?: string;
-
-  @IsOptional()
-  @IsArray()
-  @IsString({ each: true })
-  specificTimes?: string[];
-
-  @IsOptional()
-  @IsArray()
-  @IsString({ each: true })
-  daysOfWeek?: string[];
-
-  @IsOptional()
-  @IsDateString()
-  firstDoseAt?: string;
-
-  @IsOptional()
-  @IsBoolean()
-  asNeeded?: boolean;
-}
 
 export class PendingMedicationActionDto {
   @IsIn(['create_medication'])
   tool: 'create_medication';
 
-  @ValidateNested()
-  @Type(() => CreateMedicationArgsDto)
-  args: CreateMedicationArgsDto;
+  // Only ever echoed back by builds that predate server-side history, and
+  // ignored (see ChatDto.history). Not validated field by field: the proposal
+  // shape gained drugs[] and endDate, and an old build echoing a new-shape
+  // proposal must not 400 the whole message under forbidNonWhitelisted.
+  @IsObject()
+  args: Record<string, unknown>;
 }
 
 export class ChatMessageDto {

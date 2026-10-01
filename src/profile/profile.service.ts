@@ -9,6 +9,8 @@ import { ConditionService } from '../condition/condition.service';
 import { profiles, countries } from '../db/schema';
 import { CreateProfileDto } from './dto/create-profile.dto';
 import { UpdateProfileDto } from './dto/update-profile.dto';
+import { UpdateLocaleDto } from './dto/update-locale.dto';
+import { canonicalLocale, isValidTimeZone } from './locale.util';
 
 @Injectable()
 export class ProfileService {
@@ -74,5 +76,31 @@ export class ProfileService {
       .returning();
 
     return updatedProfile;
+  }
+
+  /**
+   * Record the zone and locale the phone reports (B12).
+   *
+   * Separate from updateProfile because the app calls it on its own, on
+   * launch and foreground, and it must neither trip the profile form's
+   * validation nor 404: someone who only cares for others has no profile, so
+   * there is nothing to store and that is fine.
+   */
+  async updateLocale(userId: string, dto: UpdateLocaleDto) {
+    if (!isValidTimeZone(dto.timezone)) {
+      throw new BadRequestException(`Unknown timezone "${dto.timezone}"`);
+    }
+    const locale = dto.locale ? canonicalLocale(dto.locale) : null;
+    if (dto.locale && !locale) {
+      throw new BadRequestException(`Unknown locale "${dto.locale}"`);
+    }
+
+    const updated = await this.db
+      .update(profiles)
+      .set({ timezone: dto.timezone, ...(locale ? { locale } : {}) })
+      .where(eq(profiles.userId, userId))
+      .returning({ id: profiles.id });
+
+    return { updated: updated.length > 0 };
   }
 }
