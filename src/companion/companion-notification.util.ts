@@ -6,6 +6,8 @@
 export interface MissedDoseItem {
   medicationName: string;
   scheduledFor: Date;
+  /** The owner chose not to take it, rather than forgetting. */
+  skipped?: boolean;
 }
 
 /**
@@ -48,10 +50,20 @@ export function companionMissedDoseCopy(
 ): { title: string; body: string } {
   const name = displayFirstName(ownerFullName);
 
+  // "Skipped" was the owner's choice and "missed" wasn't, so the title says
+  // which. A mix of the two can only honestly be "didn't take".
+  const skipped = items.filter((i) => i.skipped).length;
+  const verb =
+    skipped === 0
+      ? 'missed'
+      : skipped === items.length
+        ? 'skipped'
+        : "didn't take";
+
   if (items.length === 1) {
     const [item] = items;
     return {
-      title: `${name} missed a dose`,
+      title: `${name} ${verb} a dose`,
       body: `${item.medicationName} at ${formatDoseTime(item.scheduledFor, tz)}`,
     };
   }
@@ -65,7 +77,7 @@ export function companionMissedDoseCopy(
       : `${names.slice(0, 2).join(', ')} and ${names.length - 2} more`;
 
   return {
-    title: `${name} missed ${items.length} doses`,
+    title: `${name} ${verb} ${items.length} doses`,
     body: listed,
   };
 }

@@ -1,4 +1,4 @@
-import { projectStock, daysUntil } from './stock.util';
+import { projectStock, daysUntil, consumedUnits } from './stock.util';
 
 const DAY = 24 * 60 * 60 * 1000;
 const BASE = new Date('2026-07-25T08:00:00Z');
@@ -82,5 +82,38 @@ describe('daysUntil', () => {
 
   it('clamps a past date to zero rather than going negative', () => {
     expect(daysUntil(new Date(BASE.getTime() - 5 * DAY), BASE)).toBe(0);
+  });
+});
+
+describe('consumedUnits', () => {
+  it('spends the full dose for taken and only the stated amount for partial', () => {
+    expect(consumedUnits('taken', null, 2)).toBe(2);
+    expect(consumedUnits('partial', 1, 2)).toBe(1);
+  });
+
+  // Skipped and missed doses were never taken, so they hold no stock.
+  it('spends nothing for pending, skipped or missed', () => {
+    for (const status of ['pending', 'skipped', 'missed', null]) {
+      expect(consumedUnits(status, null, 2)).toBe(0);
+    }
+  });
+
+  // The update path moves stock by the difference, so each correction
+  // hands back or spends exactly the gap.
+  it('makes every correction a difference of two values', () => {
+    const delta = (
+      from: [string, number | null],
+      to: [string, number | null],
+    ) => consumedUnits(to[0], to[1], 3) - consumedUnits(from[0], from[1], 3);
+
+    expect(delta(['pending', null], ['partial', 1])).toBe(1);
+    expect(delta(['partial', 1], ['taken', null])).toBe(2);
+    expect(delta(['taken', null], ['partial', 2])).toBe(-1);
+    expect(delta(['partial', 2], ['pending', null])).toBe(-2);
+    expect(delta(['taken', null], ['taken', null])).toBe(0);
+  });
+
+  it('treats a partial row with no amount as having used nothing', () => {
+    expect(consumedUnits('partial', null, 2)).toBe(0);
   });
 });

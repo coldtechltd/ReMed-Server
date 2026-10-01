@@ -13,6 +13,8 @@ import { LogDoseDto } from './dto/log-dose.dto';
 import { DRIZZLE_CLIENT } from '../db/drizzle.module';
 import { ScheduleService } from '../schedule/schedule.service';
 import { dayKeyInTz, zonedTimeToUtc } from '../schedule/schedule.util';
+import { consumedUnits } from '../dosage-form/stock.util';
+import { summarizeAdherence } from './adherence.util';
 
 @Injectable()
 export class DoseEventService {
@@ -298,6 +300,8 @@ export class DoseEventService {
       .select({
         status: schema.doseEvents.status,
         scheduledFor: schema.doseEvents.scheduledFor,
+        takenAmount: schema.doseEvents.takenAmount,
+        dosageAmount: schema.dosageForms.dosageAmount,
         medicationName: schema.medications.name,
       })
       .from(schema.doseEvents)
@@ -327,99 +331,23 @@ export class DoseEventService {
     // YYYY-MM-DD bucket key in the user's timezone (server-local fallback).
     const dayKey = (d: Date) => dayKeyInTz(d, tz);
 
-    let taken = 0;
-    let missed = 0;
-    let pending = 0;
-    const byDayMap = new Map<
-      string,
-      { taken: number; missed: number; pending: number }
-    >();
-    const perMedMap = new Map<string, { taken: number; missed: number }>();
-
-    for (const r of rows) {
-      const key = dayKey(r.scheduledFor);
-      const day = byDayMap.get(key) ?? { taken: 0, missed: 0, pending: 0 };
-      const med = perMedMap.get(r.medicationName) ?? { taken: 0, missed: 0 };
-
-      if (r.status === 'taken') {
-        taken++;
-        day.taken++;
-        med.taken++;
-      } else if (r.status === 'missed') {
-        missed++;
-        day.missed++;
-        med.missed++;
-      } else {
-        pending++;
-        day.pending++;
-      }
-
-      byDayMap.set(key, day);
-      perMedMap.set(r.medicationName, med);
-    }
-
-    const resolved = taken + missed;
-    const adherenceRate = resolved === 0 ? null : taken / resolved;
-
-    const byDay = [...byDayMap.entries()]
-      .map(([date, counts]) => ({ date, ...counts }))
-      .sort((a, b) => a.date.localeCompare(b.date));
-
-    // Streaks: a day "counts" if it had at least one taken dose and no missed
-    // doses. Walk backwards from today for the current streak; scan all days
-    // for the longest run.
-    const adherentDays = new Set(
-      byDay.filter((d) => d.taken > 0 && d.missed === 0).map((d) => d.date),
+    // The counting rules, including how skipped and partial doses score, live
+    // in adherence.util.ts where they're tested.
+    const summary = summarizeAdherence(
+      rows.map((r) => ({
+        status: r.status,
+        dayKey: dayKey(r.scheduledFor),
+        medicationName: r.medicationName,
+        takenAmount: r.takenAmount,
+        dosageAmount: r.dosageAmount,
+      })),
+      dayKey(new Date()),
     );
-
-    let currentStreak = 0;
-    const cursor = new Date();
-    cursor.setHours(12, 0, 0, 0);
-    // Skip today if it has no resolved doses yet (don't punish a day in progress).
-    const todayKey = dayKey(new Date());
-    const todayCounts = byDayMap.get(todayKey);
-    if (todayCounts && todayCounts.taken === 0 && todayCounts.missed === 0) {
-      cursor.setDate(cursor.getDate() - 1);
-    }
-    while (adherentDays.has(dayKey(cursor))) {
-      currentStreak++;
-      cursor.setDate(cursor.getDate() - 1);
-    }
-
-    let longestStreak = 0;
-    let run = 0;
-    let prev: Date | null = null;
-    for (const date of [...adherentDays].sort()) {
-      const d = new Date(date);
-      if (
-        prev &&
-        (d.getTime() - prev.getTime()) / (24 * 60 * 60 * 1000) === 1
-      ) {
-        run++;
-      } else {
-        run = 1;
-      }
-      longestStreak = Math.max(longestStreak, run);
-      prev = d;
-    }
 
     return {
       from: dayKey(from),
       to: dayKey(to),
-      totals: { taken, missed, pending },
-      adherenceRate,
-      currentStreak,
-      longestStreak,
-      byDay,
-      perMedication: [...perMedMap.entries()]
-        .map(([name, c]) => ({
-          name,
-          taken: c.taken,
-          missed: c.missed,
-          adherenceRate:
-            c.taken + c.missed === 0 ? null : c.taken / (c.taken + c.missed),
-        }))
-        .sort((a, b) => b.taken + b.missed - (a.taken + a.missed)),
+      ...summary,
     };
   }
 
@@ -581,11 +509,18 @@ export class DoseEventService {
       updateData.status = 'pending';
       updateData.reminderSent = false;
       updateData.snoozeCount = sql`${schema.doseEvents.snoozeCount} + 1`;
+      // Back to pending means nothing has been taken yet.
+      updateData.takenAt = null;
+      updateData.takenAmount = null;
+    }
+
+    if (updateDto.takenAmount !== undefined && updateDto.status !== 'partial') {
+      throw new BadRequestException('takenAmount is only for status=partial');
     }
 
     if (updateDto.status) {
       updateData.status = updateDto.status;
-      if (updateDto.status === 'taken') {
+      if (updateDto.status === 'taken' || updateDto.status === 'partial') {
         // A dose can be logged late or early ("taken at 9:30, not 9:00"), so
         // takenAt is the user's stated time when given. The same small future
         // tolerance as logDose covers clock skew between device and server
@@ -605,6 +540,25 @@ export class DoseEventService {
         // after all) must not leave a stale takenAt behind.
         updateData.takenAt = null;
       }
+
+      // A partial dose is strictly less than the full one; the full amount
+      // is "taken", and stock is integer, so a one-unit dose has no partial.
+      if (updateDto.status === 'partial') {
+        const full = existing.dosageForm.dosageAmount;
+        if (updateDto.takenAmount === undefined) {
+          throw new BadRequestException(
+            'A partial dose needs takenAmount — how much was actually taken',
+          );
+        }
+        if (updateDto.takenAmount >= full) {
+          throw new BadRequestException(
+            `A partial dose must be less than the full dose of ${full} ${existing.dosageForm.dosageUnit ?? ''}`.trim(),
+          );
+        }
+        updateData.takenAmount = updateDto.takenAmount;
+      } else {
+        updateData.takenAmount = null;
+      }
     }
     if (updateDto.reminderSent !== undefined) {
       updateData.reminderSent = updateDto.reminderSent;
@@ -617,30 +571,43 @@ export class DoseEventService {
       .set(updateData)
       .where(eq(schema.doseEvents.id, id))
       .returning();
+    if (!updated) {
+      throw new NotFoundException(`Dose event with ID ${id} not found`);
+    }
 
     // Keep stock in step with the *transition*, not the target state, and only
     // for forms that actually track stock.
     //
-    // Both directions matter now that a logged dose can be corrected: entering
-    // "taken" spends a dose, leaving it gives that dose back. Guarding on the
-    // transition (rather than on the new status alone) is what stops a repeated
+    // Every correction has to be reversible: taken → pending gives the dose
+    // back, taken → partial gives back the part not taken, and a replayed
+    // write moves nothing. Moving stock by the difference in consumed units
+    // (see consumedUnits) covers all of those, and is what stops a repeated
     // "taken" from double-decrementing. Floor at 0 so we never go negative.
     const tracksStock = existing.dosageForm.quantityOnHand !== null;
-    const wasTaken = existing.status === 'taken';
-    const isTaken = updateData.status === 'taken';
+    const delta =
+      consumedUnits(
+        updated.status,
+        updated.takenAmount,
+        existing.dosageForm.dosageAmount,
+      ) -
+      consumedUnits(
+        existing.status,
+        existing.takenAmount,
+        existing.dosageForm.dosageAmount,
+      );
 
-    if (tracksStock && !wasTaken && isTaken) {
+    if (tracksStock && delta > 0) {
       await this.db
         .update(schema.dosageForms)
         .set({
-          quantityOnHand: sql`GREATEST(${schema.dosageForms.quantityOnHand} - ${existing.dosageForm.dosageAmount}, 0)`,
+          quantityOnHand: sql`GREATEST(${schema.dosageForms.quantityOnHand} - ${delta}, 0)`,
         })
         .where(eq(schema.dosageForms.id, existing.dosageForm.id));
-    } else if (tracksStock && wasTaken && updateDto.status && !isTaken) {
+    } else if (tracksStock && delta < 0) {
       await this.db
         .update(schema.dosageForms)
         .set({
-          quantityOnHand: sql`${schema.dosageForms.quantityOnHand} + ${existing.dosageForm.dosageAmount}`,
+          quantityOnHand: sql`${schema.dosageForms.quantityOnHand} + ${-delta}`,
         })
         .where(eq(schema.dosageForms.id, existing.dosageForm.id));
     }

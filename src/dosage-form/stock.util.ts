@@ -69,3 +69,25 @@ export function daysUntil(runsOutAt: Date, now: Date): number {
   const ms = runsOutAt.getTime() - now.getTime();
   return Math.max(0, Math.floor(ms / (24 * 60 * 60 * 1000)));
 }
+
+/**
+ * Units of stock a dose event has used up, given its status.
+ *
+ * `DoseEventService.update` moves stock by the *difference* between the
+ * before and after values of this, rather than keying on "entering taken" and
+ * "leaving taken". A partial dose sits between the two, so every correction
+ * (taken → partial, partial → pending, partial 1 → taken) has to hand back or
+ * spend exactly the gap, and a replayed write moves nothing at all.
+ *
+ * `takenAmount` is only read for "partial". A partial row with no amount
+ * (which the API never writes) consumes nothing rather than a guess.
+ */
+export function consumedUnits(
+  status: string | null,
+  takenAmount: number | null,
+  dosageAmount: number,
+): number {
+  if (status === 'taken') return dosageAmount;
+  if (status === 'partial') return takenAmount ?? 0;
+  return 0;
+}

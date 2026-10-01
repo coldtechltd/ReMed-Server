@@ -21,7 +21,15 @@ export const doseEvents = pgTable(
       .notNull(),
     scheduledFor: timestamp('scheduled_for').defaultNow().notNull(),
     takenAt: timestamp('taken_at'),
-    status: varchar('status', { length: 50 }).default('pending'), // pending | taken | missed
+    // pending | taken | partial | skipped | missed. "skipped" is the user
+    // choosing not to take it; "missed" is the hourly cron's verdict that
+    // nobody logged it. Adherence counts the two differently, so the app's
+    // Skip button must never write "missed".
+    status: varchar('status', { length: 50 }).default('pending'),
+    // How much was actually taken, in the form's dosageUnit. Set only for
+    // "partial" (always less than the form's dosageAmount), null otherwise.
+    // Stock is debited by this, not by the full dose.
+    takenAmount: integer('taken_amount'),
     reminderSent: boolean('reminder_sent').default(false),
     // Latch for the companion missed-dose alert. Deliberately NOT reminderSent:
     // that one is the owner's due-reminder flag and is already true by the time

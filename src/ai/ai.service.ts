@@ -70,7 +70,8 @@ ADDING A MEDICATION REMINDER:
 LOGGING OR REVIEWING DOSES:
 - To answer anything about today's doses, or to act on one, call get_todays_doses first. You cannot know a dose's id any other way — never guess one.
 - For "how am I doing?", "what did I miss this week?", or anything about streaks and adherence, call get_adherence_summary and report the numbers plainly.
-- To mark a dose taken or missed, or to snooze one, call propose_dose_action, then say in one short sentence what you are about to do and ask them to confirm. Only call confirm_dose_action on a LATER turn after they explicitly agree.
+- To mark a dose taken, skipped or missed, or to snooze one, call propose_dose_action, then say in one short sentence what you are about to do and ask them to confirm. Only call confirm_dose_action on a LATER turn after they explicitly agree.
+- "skipped" is for a dose the user chose not to take ("I'm skipping tonight's"), "missed" for one they forgot. Whether to skip a dose is a medical decision: record the user's choice, never make or suggest it.
 - Be careful about intent: "I need to take my pill" is not "I took my pill", and "should I take it now?" is a question, not a confirmation. When it is ambiguous, ask before proposing anything. A dose record the user did not mean to create is worse than an extra question.`;
 
 // Groq decommissioned `llama-3.3-70b-versatile` — requests for it now come
@@ -127,7 +128,7 @@ export interface PendingMedicationAction {
 
 export interface DoseActionArgs {
   doseEventId: string;
-  action: 'taken' | 'missed' | 'snooze';
+  action: 'taken' | 'skipped' | 'missed' | 'snooze';
   snoozeMinutes?: number | null;
   /** Human-readable label, so the client can render the card without a lookup. */
   label?: string;
@@ -326,7 +327,7 @@ const DOSE_WRITE_TOOLS: Groq.Chat.ChatCompletionTool[] = [
     function: {
       name: 'propose_dose_action',
       description:
-        'Propose marking a dose as taken or missed, or snoozing it. This does NOT change anything — it shows the user what you intend to do so they can confirm. Get the dose id from get_todays_doses first.',
+        'Propose marking a dose as taken, skipped (the user chose not to take it) or missed (they forgot), or snoozing it. This does NOT change anything — it shows the user what you intend to do so they can confirm. Get the dose id from get_todays_doses first.',
       parameters: {
         type: 'object',
         properties: {
@@ -336,7 +337,7 @@ const DOSE_WRITE_TOOLS: Groq.Chat.ChatCompletionTool[] = [
           },
           action: {
             type: 'string',
-            enum: ['taken', 'missed', 'snooze'],
+            enum: ['taken', 'skipped', 'missed', 'snooze'],
             description: 'What to do with the dose.',
           },
           snoozeMinutes: {
@@ -724,6 +725,9 @@ export class AiService {
         message: JSON.stringify({
           days,
           taken: stats.totals.taken,
+          partial: stats.totals.partial,
+          // Skipped doses were the user's choice and are not in the rate.
+          skipped: stats.totals.skipped,
           missed: stats.totals.missed,
           pending: stats.totals.pending,
           adherenceRate: stats.adherenceRate,
@@ -756,8 +760,15 @@ export class AiService {
     if (!doseEventId) {
       return { error: 'No dose id given. Call get_todays_doses first.' };
     }
-    if (action !== 'taken' && action !== 'missed' && action !== 'snooze') {
-      return { error: 'action must be "taken", "missed" or "snooze".' };
+    if (
+      action !== 'taken' &&
+      action !== 'skipped' &&
+      action !== 'missed' &&
+      action !== 'snooze'
+    ) {
+      return {
+        error: 'action must be "taken", "skipped", "missed" or "snooze".',
+      };
     }
 
     let snoozeMinutes: number | null = null;

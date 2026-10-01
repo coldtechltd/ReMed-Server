@@ -86,6 +86,29 @@ describe('companionMissedDoseCopy', () => {
     expect(copy.title).toBe('Ada missed 4 doses');
     expect(copy.body).toBe('A, B and 2 more');
   });
+
+  // A skip was the owner's choice; the alert shouldn't call it forgetting.
+  it('says "skipped" when every dose was skipped', () => {
+    const one = companionMissedDoseCopy(
+      'Ada',
+      [{ medicationName: 'Metformin', scheduledFor: at, skipped: true }],
+      'UTC',
+    );
+    expect(one.title).toBe('Ada skipped a dose');
+    expect(one.body).toBe('Metformin at 8:00 PM');
+  });
+
+  it('says "didn\'t take" for a mix of skipped and missed', () => {
+    const copy = companionMissedDoseCopy(
+      'Ada',
+      [
+        { medicationName: 'Metformin', scheduledFor: at, skipped: true },
+        { medicationName: 'Lisinopril', scheduledFor: at },
+      ],
+      'UTC',
+    );
+    expect(copy.title).toBe("Ada didn't take 2 doses");
+  });
 });
 
 describe('companionRefillCopy', () => {

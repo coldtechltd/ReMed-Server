@@ -1,0 +1,1 @@
+ALTER TABLE "dose_events" ADD COLUMN "taken_amount" integer;

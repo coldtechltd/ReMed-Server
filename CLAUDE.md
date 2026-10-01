@@ -44,7 +44,7 @@ Sessions are **per device, not per user**. The client sends `X-Device-Id` on eve
 medication (type: continuous|course, status: active|completed)
   └─ dosage_form  (physical form + quantityOnHand → stock/refill logic)
        └─ schedule (type, intervalValue/Unit, specificTimes, daysOfWeek, timezone, isActive)
-            └─ dose_event (scheduledFor, status: pending|taken|missed, snoozeCount)
+            └─ dose_event (scheduledFor, status: pending|taken|partial|skipped|missed, takenAmount, snoozeCount)
 ```
 
 `medications.status` (lifecycle) and `schedules.isActive` (the user's reminder toggle) are different switches; **both** must be on for doses to generate or fire.
@@ -93,9 +93,13 @@ Every message is also mirrored into **`notification_deliveries`** (`accepted`/`r
 
 ### Stock / refill
 
+`DoseEventService.update` moves stock by the difference in `consumedUnits` (`stock.util.ts`) between the row's old and new status: a full dose for `taken`, `takenAmount` for `partial`, nothing otherwise. That one rule covers every correction (taken → partial hands back the rest, a replayed write moves nothing). Don't reintroduce "entering/leaving taken" branches.
+
 `dosage-form/stock.util.ts` projects run-out by walking **pending dose events**, not the schedule definition, so intervals, day gaps and end dates are already accounted for. Its "stock landing on exactly 0 counts as covered" boundary is deliberate and asserted in tests — don't "fix" it to `<= 0`. Refill pushes are predictive (5-day lead time), fall back to `refillThreshold` only when nothing is projectable (as-needed), and are throttled by `refillReminderSentAt`, which `DosageFormService.update` clears on restock.
 
-### Adherence and PRN
+### Adherence, skipped and partial doses, and PRN
+
+The counting rules live in `dose-event/adherence.util.ts`, pure and tested; `getStats` only fetches rows and hands them over. `skipped` (the user chose not to take it) and `missed` (the hourly cron's verdict that nobody logged it) are deliberately different: a skipped dose is left out of the rate and a day where everything was skipped carries a streak without growing it, while a missed one scores against both. The app's Skip button wrote `missed` until the split, so no client may go back to doing that. A `partial` dose stores `takenAmount`, in whole units and strictly less than the form's `dosageAmount` (so a one-unit dose has no partial), and scores by the fraction taken. Companion missed-dose alerts include skipped doses, worded "skipped" by `companionMissedDoseCopy`, because Skip alerted companions when it still wrote `missed`.
 
 `getStats` filters with `scheduledOnly`, which excludes `as_needed` schedules. A logged PRN dose is a real `taken` row but was never *scheduled*, so counting it inflates the adherence rate and streak — taking an extra painkiller would make adherence look better. The home screen's day ring applies the same rule client-side. `GET /dosage-form/as-needed` exists because PRN medications materialize no dose events and are therefore invisible to every dose-event read path.
 
@@ -112,7 +116,7 @@ Groq (`llama-3.3-70b-versatile`) with tool-calling. The safety-critical system p
 - llama-3.3 emits explicit `null` for unused optional fields, so every non-required tool property accepts `['string','null']` and nulls are stripped in `stripNulls`; a bare `type: 'string'` fails Groq validation with `tool_use_failed`.
 - Tips are cached per user for 24h (`ai_tips_cache`); serving from cache must not spend quota.
 - **The conversation is persisted server-side in `ai_messages`** (one rolling thread per user, last 10 turns fed to the model). `ChatDto.history` is still accepted but ignored. This is a security fix, not just a feature: `runChat` used to read `priorPendingAction` out of the *client-supplied* history, so a crafted request could present a proposal the assistant had never made and have `create_medication` execute against it.
-- Dose tools follow the same two-step contract. `get_todays_doses` / `get_adherence_summary` are read-only and run immediately; `propose_dose_action` → `confirm_dose_action` is propose-then-execute against stored args, because a dose record the user did not mean to create is a falsified medical record. `get_todays_doses` must run first — the model cannot invent a dose UUID. Each tool set is attached only when its intent regex matches (`needsMedicationTools`, `needsDoseTools`), since each costs ~1k input tokens per turn.
+- Dose tools follow the same two-step contract. `get_todays_doses` / `get_adherence_summary` are read-only and run immediately; `propose_dose_action` (taken / skipped / missed / snooze; partial is app-only, since it needs an amount) → `confirm_dose_action` is propose-then-execute against stored args, because a dose record the user did not mean to create is a falsified medical record. `get_todays_doses` must run first — the model cannot invent a dose UUID. Each tool set is attached only when its intent regex matches (`needsMedicationTools`, `needsDoseTools`), since each costs ~1k input tokens per turn.
 
 ### Billing / entitlements
 
@@ -123,4 +127,4 @@ Groq (`llama-3.3-70b-versatile`) with tool-calling. The safety-critical system p
 - Comments in this codebase explain *why* a non-obvious rule exists (DST anchoring, the stock boundary, receipt polling, snooze preservation). Keep that style; those comments are load-bearing documentation.
 - User-facing "day" boundaries are computed in the user's IANA timezone (`dayBoundsInTz`, `endOfDayInTz`) and fall back to server-local rather than 500ing on a bad zone.
 - Dose-event reads filter with `notStoppedBefore`, which hides events scheduled after a medication's `completedAt` — stopped medications shouldn't linger on the home screen.
-- Tests are colocated `*.spec.ts` and cover the pure utilities and billing parsing (`schedule.util`, `stock.util`, `entitlement.service`, `revenuecat.types`, auth). New timing/stock rules belong in those pure modules so they stay testable without a database.
+- Tests are colocated `*.spec.ts` and cover the pure utilities and billing parsing (`schedule.util`, `stock.util`, `adherence.util`, `entitlement.service`, `revenuecat.types`, auth). New timing/stock rules belong in those pure modules so they stay testable without a database.

@@ -605,6 +605,7 @@ export class NotificationsService {
       const missed = await this.db
         .select({
           eventId: schema.doseEvents.id,
+          status: schema.doseEvents.status,
           scheduledFor: schema.doseEvents.scheduledFor,
           timezone: schema.schedules.timezone,
           medicationName: schema.medications.name,
@@ -625,7 +626,10 @@ export class NotificationsService {
         )
         .where(
           and(
-            eq(schema.doseEvents.status, 'missed'),
+            // Skipped too: the app's Skip button wrote "missed" until the two
+            // were split, and a caregiver was told about those. Splitting the
+            // status changes the wording of the alert, not whether it's sent.
+            inArray(schema.doseEvents.status, ['missed', 'skipped']),
             isNull(schema.doseEvents.companionAlertSentAt),
             gte(schema.doseEvents.scheduledFor, since),
             eq(schema.medications.isPrivate, false),
@@ -728,6 +732,7 @@ export class NotificationsService {
           group.items.push({
             medicationName: m.medicationName,
             scheduledFor: m.scheduledFor,
+            skipped: m.status === 'skipped',
           });
           group.eventIds.push(m.eventId);
           groups.set(key, group);
