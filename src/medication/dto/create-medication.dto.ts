@@ -71,4 +71,14 @@ export class CreateMedicationDto {
   @IsOptional()
   @IsBoolean()
   isPrivate?: boolean;
+
+  @ApiPropertyOptional({
+    description:
+      'Send dose reminders as alarms that can break through Do Not Disturb ' +
+      '(iOS Time Sensitive, Android dose_alarm channel).',
+    default: false,
+  })
+  @IsOptional()
+  @IsBoolean()
+  isCritical?: boolean;
 }

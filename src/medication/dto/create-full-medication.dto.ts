@@ -183,6 +183,14 @@ export class CreateFullMedicationDto {
   @IsBoolean()
   isPrivate?: boolean;
 
+  @ApiPropertyOptional({
+    description: 'Send dose reminders as alarms that can break through DND.',
+    default: false,
+  })
+  @IsOptional()
+  @IsBoolean()
+  isCritical?: boolean;
+
   @ApiProperty({ type: [FullDosageFormDto] })
   @IsArray()
   @ArrayMinSize(1)

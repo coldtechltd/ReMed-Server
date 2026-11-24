@@ -90,6 +90,7 @@ export class MedicationService {
           startDate: new Date(dto.startDate),
           endDate,
           isPrivate: dto.isPrivate ?? false,
+          isCritical: dto.isCritical ?? false,
         })
         .returning();
 
@@ -171,6 +172,7 @@ export class MedicationService {
         startDate: new Date(createMedicationDto.startDate),
         endDate,
         isPrivate: createMedicationDto.isPrivate ?? false,
+        isCritical: createMedicationDto.isCritical ?? false,
       })
       .returning();
 
@@ -249,6 +251,10 @@ export class MedicationService {
     // nothing needs regenerating, since it only ever filters queries.
     if (updateMedicationDto.isPrivate !== undefined)
       updateData.isPrivate = updateMedicationDto.isPrivate;
+    // Only changes how reminders are delivered, read at send time. The other
+    // devices re-sync their on-phone copies via DeviceSyncInterceptor.
+    if (updateMedicationDto.isCritical !== undefined)
+      updateData.isCritical = updateMedicationDto.isCritical;
 
     // Type and endDate are coupled, so resolve them together against the merged
     // state: changing only the type must drag endDate along with it.

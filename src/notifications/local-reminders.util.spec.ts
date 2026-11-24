@@ -1,6 +1,7 @@
 import {
   MAX_LOCAL_REMINDERS,
   doseReminderCopy,
+  doseReminderDelivery,
   isCoveredLocally,
   sanitizeClaim,
 } from './local-reminders.util';
@@ -81,6 +82,29 @@ describe('doseReminderCopy', () => {
     ).toEqual({
       title: 'Time to take Amoxicillin',
       body: '500 mg of Capsule',
+    });
+  });
+});
+
+describe('doseReminderDelivery', () => {
+  it('sends a critical medication as a time-sensitive alarm', () => {
+    expect(doseReminderDelivery({ isCritical: true })).toEqual({
+      channelId: 'dose_alarm',
+      interruptionLevel: 'time-sensitive',
+      critical: true,
+    });
+  });
+
+  it('leaves an ordinary medication on the default channel', () => {
+    // No interruptionLevel at all: iOS then uses its normal "active" level,
+    // which Focus modes are free to hold back.
+    expect(doseReminderDelivery({ isCritical: false })).toEqual({
+      channelId: 'default',
+      critical: false,
+    });
+    expect(doseReminderDelivery({})).toEqual({
+      channelId: 'default',
+      critical: false,
     });
   });
 });

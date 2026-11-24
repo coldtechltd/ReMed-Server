@@ -30,6 +30,7 @@ import {
   LOCAL_REMINDER_WINDOW_MS,
   MAX_LOCAL_REMINDERS,
   doseReminderCopy,
+  doseReminderDelivery,
   isCoveredLocally,
   sanitizeClaim,
 } from './local-reminders.util';
@@ -228,6 +229,7 @@ export class NotificationsService {
         scheduledFor: r.event.scheduledFor.toISOString(),
         updatedAt: r.event.updatedAt.toISOString(),
         ...doseReminderCopy(r.medication, r.dosageForm),
+        critical: doseReminderDelivery(r.medication).critical,
       })),
     };
   }
@@ -510,18 +512,25 @@ export class NotificationsService {
           continue;
         }
 
+        const delivery = doseReminderDelivery(dose.medication);
         messages.push({
           to: pushToken,
           sound: 'default',
           ...doseReminderCopy(dose.medication, dose.dosageForm),
-          data: { eventId: dose.event.id },
+          data: delivery.critical
+            ? { eventId: dose.event.id, critical: true }
+            : { eventId: dose.event.id },
           categoryId: 'dose_reminder',
+          ...(delivery.interruptionLevel
+            ? { interruptionLevel: delivery.interruptionLevel }
+            : {}),
           // Android needs both of these or a dose reminder arrives late and
           // silently: without an explicit channelId it lands on expo's fallback
           // "Miscellaneous" channel instead of the MAX-importance `default`
           // channel the app registers (so no heads-up), and without high
-          // priority FCM holds it until the device leaves Doze.
-          channelId: 'default',
+          // priority FCM holds it until the device leaves Doze. Critical
+          // medications use `dose_alarm` instead (see doseReminderDelivery).
+          channelId: delivery.channelId,
           priority: 'high',
         });
 

@@ -31,6 +31,12 @@ export const medications = pgTable(
     // the reason people decline to share at all, so the opt-out is per
     // medication rather than all-or-nothing.
     isPrivate: boolean('is_private').default(false).notNull(),
+    // Opt-in alarm treatment for doses that must not be slept through
+    // (insulin, anticoagulants, seizure meds). Reminders go out as iOS Time
+    // Sensitive and on Android's `dose_alarm` channel, which can bypass DND.
+    // Per medication rather than global: alarm-style reminders for a vitamin
+    // are how a reminder app gets uninstalled.
+    isCritical: boolean('is_critical').default(false).notNull(),
     createdAt: timestamp('created_at').defaultNow(),
   },
   (table) => [

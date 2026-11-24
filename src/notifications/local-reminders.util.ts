@@ -79,3 +79,28 @@ export function doseReminderCopy(
     body: `${dosageForm.dosageAmount} ${dosageForm.dosageUnit} of ${dosageForm.name}`,
   };
 }
+
+/**
+ * How a dose reminder is delivered, as opposed to what it says. A critical
+ * medication's reminders go out on the Android `dose_alarm` channel (which the
+ * app registers with bypassDnd and its own vibration) and as iOS Time
+ * Sensitive, which Focus modes let through by default. `critical` rides in
+ * `data` so the app can raise its in-app alarm instead of a banner.
+ *
+ * Android caveat: a build that predates the `dose_alarm` channel files these
+ * under expo's fallback channel, so they still arrive, just without the alarm
+ * treatment.
+ */
+export function doseReminderDelivery(medication: { isCritical?: boolean }): {
+  channelId: 'default' | 'dose_alarm';
+  interruptionLevel?: 'time-sensitive';
+  critical: boolean;
+} {
+  return medication.isCritical
+    ? {
+        channelId: 'dose_alarm',
+        interruptionLevel: 'time-sensitive',
+        critical: true,
+      }
+    : { channelId: 'default', critical: false };
+}

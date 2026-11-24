@@ -1,0 +1,1 @@
+ALTER TABLE "medications" ADD COLUMN "is_critical" boolean DEFAULT false NOT NULL;
